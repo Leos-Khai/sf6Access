@@ -150,6 +150,11 @@ public static class LocalizedText
     public static string AtMeters(string what, int meters)
         => string.Format(LangFile.Get("wt.at_meters", "{0}, {1} meters away"), what, meters);
 
+    /// <summary>"Leaving Shop counter" — the announced interactable just went
+    /// out of interaction range (nothing else is in range either).</summary>
+    public static string LeavingTarget(string what)
+        => string.Format(LangFile.Get("wt.leaving", "Leaving {0}"), what);
+
     /// <summary>"person at 2 o'clock, 14 meters away" — distance plus the
     /// camera-relative clock direction (12 = straight ahead of the camera,
     /// i.e. stick up). Used when a direction frame could be read; plain
@@ -231,6 +236,16 @@ public static class LocalizedText
         _ => LangFile.Get("wt.nav_front_open", "Clear ahead"),
     };
 
+    /// <summary>The game says the avatar is stopped, but the forward rays saw
+    /// nothing to name — a fence or a prop the ray filter does not report though the
+    /// capsule collides with it. Said instead of "clear ahead", which would be the
+    /// exact false positive this phrase exists to prevent.</summary>
+    public static string NavBlocked() => LangFile.Get("wt.nav_front_blocked", "Blocked");
+
+    /// <summary>A wall the avatar can RUN ALONG. A route, not a dead end, so it is
+    /// deliberately not spoken as a wall.</summary>
+    public static string NavWallRide() => LangFile.Get("wt.nav_front_wallride", "Wall you can run along");
+
     /// <summary>"Wall at 0.5 meters" — the obstacle class plus the engine's own
     /// contact distance.</summary>
     public static string NavObstacleAt(string what, float meters)
@@ -248,6 +263,52 @@ public static class LocalizedText
     public static string NavRightOpen() => LangFile.Get("wt.nav_right_open", "right open");
 
     public static string NavRightBlocked() => LangFile.Get("wt.nav_right_blocked", "right blocked");
+
+    /// <summary>"left clear for 14 meters" — an open side WITH the distance the
+    /// avatar's body could actually travel that way.
+    ///
+    /// <para>The bare "left open" it replaces was true at anything past two metres,
+    /// which is what let the readout agree with a cue about a shopfront recess. The
+    /// number is the same clearance the cue channel decides on
+    /// (<see cref="WorldTour.FieldRadarClearance"/>), so the two can be compared by
+    /// ear.</para></summary>
+    public static string NavLeftClearFor(float meters)
+        => string.Format(LangFile.Get("wt.nav_left_clear", "left clear for {0} meters"), Metres(meters));
+
+    /// <summary>"right clear for 14 meters" — see <see cref="NavLeftClearFor"/>.</summary>
+    public static string NavRightClearFor(float meters)
+        => string.Format(LangFile.Get("wt.nav_right_clear", "right clear for {0} meters"), Metres(meters));
+
+    /// <summary>All four radar beams closed: "enclosed space".</summary>
+    public static string NavEnclosed() => LangFile.Get("wt.nav_enclosed", "Enclosed space");
+
+    /// <summary>The first beam to open after "enclosed": "exit on the left".</summary>
+    public static string NavExit(WorldTour.RadarBeam beam) => beam switch
+    {
+        WorldTour.RadarBeam.Left => LangFile.Get("wt.nav_exit_left", "Exit on the left"),
+        WorldTour.RadarBeam.Right => LangFile.Get("wt.nav_exit_right", "Exit on the right"),
+        _ => LangFile.Get("wt.nav_exit_front", "Exit ahead"),
+    };
+
+    /// <summary>"opening at 10 o'clock, 2.1 meters wide, 6.0 meters away" — a gap
+    /// the avatar fits through, found by <see cref="WorldTour.NavOpenings"/>. The
+    /// WIDTH is the point: it is measured between the two pieces of geometry that
+    /// flank the gap, so it tells a doorway from an alley from a decorative recess
+    /// without any of them being a distance the player has to calibrate by ear.</summary>
+    public static string NavOpening(int hour, float widthMeters, float distanceMeters)
+        => string.Format(LangFile.Get("wt.nav_opening", "opening at {0} o'clock, {1} meters wide, {2} meters away"),
+                         hour, Metres(widthMeters), Metres(distanceMeters));
+
+    /// <summary>"gap at 10 o'clock, only 0.6 meters wide" — a break in the geometry
+    /// the avatar's own collision capsule does NOT fit through. Spoken rather than
+    /// hidden: "there is a hole there but you cannot use it" is the other half of
+    /// knowing where you can go.</summary>
+    public static string NavGapTooNarrow(int hour, float widthMeters)
+        => string.Format(LangFile.Get("wt.nav_gap_narrow", "gap at {0} o'clock, only {1} meters wide"),
+                         hour, Metres(widthMeters));
+
+    /// <summary>The scan found no gap wide enough to walk through.</summary>
+    public static string NavNoOpenings() => LangFile.Get("wt.nav_no_openings", "No way through in range");
 
     public static string NavFloorSolid() => LangFile.Get("wt.nav_floor_solid", "floor ahead");
 
@@ -278,4 +339,52 @@ public static class LocalizedText
     /// <summary>Answer to the on-demand key when the place cannot be named at
     /// all. Silence would read as a broken key.</summary>
     public static string ZoneUnknown() => LangFile.Get("wt.zone_unknown", "Location unknown");
+
+    // --- World Tour compass / aim ---
+
+    /// <summary>The eight compass points, index 0 = north clockwise to 7 =
+    /// northwest (see <c>FieldHeadingService.Sector</c>).</summary>
+    public static string CompassPoint(int sector) => sector switch
+    {
+        0 => LangFile.Get("wt.dir_n", "north"),
+        1 => LangFile.Get("wt.dir_ne", "northeast"),
+        2 => LangFile.Get("wt.dir_e", "east"),
+        3 => LangFile.Get("wt.dir_se", "southeast"),
+        4 => LangFile.Get("wt.dir_s", "south"),
+        5 => LangFile.Get("wt.dir_sw", "southwest"),
+        6 => LangFile.Get("wt.dir_w", "west"),
+        _ => LangFile.Get("wt.dir_nw", "northwest"),
+    };
+
+    /// <summary>"Facing north" — the on-demand answer; the hands-free compass
+    /// speaks the bare point.</summary>
+    public static string Facing(string point)
+        => string.Format(LangFile.Get("wt.facing", "Facing {0}"), point);
+
+    /// <summary>"Luke, master, straight ahead" — the camera has just lined up
+    /// with the tracked person.</summary>
+    public static string AimAhead(string what)
+        => string.Format(LangFile.Get("wt.aim_ahead", "{0}, straight ahead"), what);
+
+    // --- World Tour compass sweep ---
+
+    /// <summary>"Open: north, east" — the compass points with nothing within the
+    /// sweep's reach.</summary>
+    public static string SweepOpen(string points)
+        => string.Format(LangFile.Get("wt.sweep_open", "Open: {0}"), points);
+
+    /// <summary>"Walls: south 3 meters, west 6 meters".</summary>
+    public static string SweepWalls(string entries)
+        => string.Format(LangFile.Get("wt.sweep_walls", "Walls: {0}"), entries);
+
+    /// <summary>One wall entry of the sweep, whole metres: at street scale a
+    /// decimal is noise.</summary>
+    public static string SweepEntry(string point, int meters)
+        => string.Format(LangFile.Get("wt.sweep_entry", "{0} {1} meters"), point, meters);
+
+    /// <summary>The sweep found nothing anywhere within reach.</summary>
+    public static string SweepAllOpen() => LangFile.Get("wt.sweep_all_open", "Open all around");
+
+    /// <summary>The sweep could not be run (no field state, no ray API).</summary>
+    public static string SweepUnavailable() => LangFile.Get("wt.sweep_unavailable", "Surroundings unavailable");
 }

@@ -22,6 +22,16 @@ namespace SF6Access.Services.WorldTour;
 /// Names are resolved against the TDB enum, never by ordinal — a name the game
 /// does not publish is simply not cast.</para>
 ///
+/// <para><b>Rays measure, the game judges (2026-09-05).</b> The rays no longer decide
+/// whether the avatar is BLOCKED — they only say what is ahead and how far. Deriving
+/// "you cannot go forward" from the ladder was wrong in both directions in play: the
+/// rungs have different reaches so a real obstruction could fall between them, and
+/// <c>TerrainRayFilter</c> does not see fences and props the capsule collides with
+/// anyway, while kerbs the avatar climbs by itself read as walls. The verdict now
+/// comes from the game's own collision state through
+/// <see cref="FieldNavVerdictService"/>; this class is the DISTANCE and DESCRIPTION
+/// sensor it is paired with.</para>
+///
 /// <para><b>The one exception:</b> the SIDEWAYS rays are cast as segments of our own
 /// (<see cref="FieldNavSideRays"/>), because every sideways ray the game publishes
 /// reaches half a metre or less. Their origin, direction and reach are still read
@@ -59,6 +69,10 @@ public static class FieldNavRadarService
     /// rung means when it is the HIGHEST rung that hits. Reading the ladder top-down
     /// (rather than testing for exact combinations) keeps the class correct when a
     /// lower ray misses under an overhang.
+    ///
+    /// <para>The result is a DESCRIPTION of what lies ahead within these rays' own
+    /// reach — "there is something about this tall in front of you" — and never the
+    /// answer to "am I stopped", which only the game's own collision can give.</para>
     ///
     /// <para><c>FRONT</c> shares the low tier with <c>FOOT_FRONT</c>: both sit below
     /// the waist ray, and the state model has no separate class between "steppable"
@@ -99,7 +113,9 @@ public static class FieldNavRadarService
     private static readonly Dictionary<string, Method> CastRayAllByState = new();
     private static TypeDefinition _resultType;
     private static Method _getContactPoint;
-    private static Method _contactDistance;
+    private static Field _contactDistanceField;
+    private static bool _contactDistanceProbed;
+    private static bool _contactDistanceIsValue;
     private static bool _unavailableLogged;
     private static bool _shortSidesLogged;
 
@@ -122,11 +138,15 @@ public static class FieldNavRadarService
             var castRayAll = ResolveCastRayAll(state);
             if (castRayAll == null) return default;
 
-            // One result object per SAMPLE, reused by all nine casts and then let
-            // go. It is never globalized (rooting an object the engine writes
-            // through is how a silent failure becomes a delayed crash) and never
-            // held across frames, where the engine's GC could move or collect it.
-            var result = FieldProbeService.NewInstance(_resultType);
+            // ONE globalized container, shared by every cast this process makes and
+            // cleared before each. The comment here used to say the opposite — that
+            // rooting an engine-written object was the route to a delayed crash — and
+            // it had the danger exactly backwards: NewInstance yields a per-thread
+            // LOCAL object (negative reference count, an index into that thread's
+            // table) which the engine's frame GC reclaims, so the delayed crash was
+            // REFramework's finalizer dereferencing it from the GC thread. See
+            // FieldProbeService.SharedInstance.
+            var result = FieldProbeService.SharedInstance(_resultType);
             if (result == null) return default;
 
             var front = FrontProfile.Open;
@@ -138,7 +158,8 @@ public static class FieldNavRadarService
                     Fold(ref nearest, d);
                 }
 
-            if (Cast(state, castRayAll, result, RAY_FRONT_LONG, out float far)) Fold(ref nearest, far);
+            bool longHit = Cast(state, castRayAll, result, RAY_FRONT_LONG, out float far);
+            if (longHit) Fold(ref nearest, far);
 
             ReadSides(state, castRayAll, result, out bool left, out bool right);
 
@@ -147,7 +168,8 @@ public static class FieldNavRadarService
             // bindings declare a NAMESPACE called `_`.)
             bool ground = Cast(state, castRayAll, result, RAY_GROUND, out float unusedG);
 
-            return new NavReading(front, nearest > 0f, nearest, left, right, ground);
+            var block = Verdict(avatar, state, ref front);
+            return new NavReading(block, front, nearest > 0f, nearest, !longHit, left, right, ground);
         }
         catch (System.Exception ex)
         {
@@ -158,6 +180,111 @@ public static class FieldNavRadarService
             }
             return default;
         }
+    }
+
+    /// <summary>How far the sweep looks in each compass direction. The game's
+    /// longest published ray (FRONT_LONG, 2 m) is a feeler, not a look around:
+    /// this is a picture of the street, and a street in Metro City is of the order
+    /// of ten metres across. UX choice, not a game value; documented here.</summary>
+    public const float SWEEP_REACH_M = 12f;
+
+    /// <summary>The compass sweep: one horizontal segment per compass point
+    /// (<see cref="FieldHeadingService.SECTORS"/> of them, index 0 = north,
+    /// clockwise), all from the origin of the game's own long forward ray, each
+    /// <see cref="SWEEP_REACH_M"/> long. Entry k is the hit distance, 0 when open.
+    /// Null when the sensor is unavailable or the compass has no north.</summary>
+    public static float[] Sweep()
+    {
+        try
+        {
+            var north = FieldHeadingService.GetNorth();
+            if (!north.Ok) return null;
+            if (!FreeCastContext(out var state, out var result, out int originRay)) return null;
+
+            // East is north turned clockwise a quarter: the same right-hand basis
+            // the clock hours use (FieldDirectionService.GetBearing).
+            float ex = -north.Z, ez = north.X;
+            var hits = new float[FieldHeadingService.SECTORS];
+            for (int k = 0; k < hits.Length; k++)
+            {
+                double rad = k * FieldHeadingService.DEGREES_PER_SECTOR * System.Math.PI / 180.0;
+                float c = (float)System.Math.Cos(rad), sn = (float)System.Math.Sin(rad);
+                float dx = north.X * c + ex * sn;
+                float dz = north.Z * c + ez * sn;
+                if (!FieldNavSideRays.TryCastDirection(state, result, _filterId, originRay, dx, dz,
+                                                       SWEEP_REACH_M, out float d))
+                    return null;
+                hits[k] = d;
+            }
+            return hits;
+        }
+        catch (System.Exception ex)
+        {
+            API.LogWarning($"[SF6Access] Nav sweep failed: {ex.GetType().Name}: {ex.Message}");
+            return null;
+        }
+    }
+
+    /// <summary>Everything a free-form segment cast needs: the avatar's field
+    /// state, a cast-result buffer and the id of the ray whose origin the segment
+    /// starts from. Shared by the compass sweep and the beams.</summary>
+    private static bool FreeCastContext(out ManagedObject state, out ManagedObject result, out int originRay)
+    {
+        state = null; result = null; originRay = -1;
+        ReadEnumsOnce();
+        if (_filterId < 0 || !RayIds.TryGetValue(RAY_FRONT_LONG, out originRay)) return false;
+
+        var pm = API.GetManagedSingleton(PLAYER_MANAGER) as ManagedObject;
+        var avatar = FlowHelper.Call(pm, "GetAvatarPlayer") as ManagedObject;
+        state = FieldProbeService.FieldState(avatar);
+        if (state == null) return false;
+        if (ResolveCastRayAll(state) == null) return false;   // also binds _resultType
+
+        result = FieldProbeService.SharedInstance(_resultType);
+        return result != null;
+    }
+
+    /// <summary>One free-form forward cast, straight ahead along
+    /// <paramref name="forward"/> for <paramref name="reach"/> metres from the
+    /// game's own long-forward-ray origin. Shared cast setup for anything that
+    /// needs the raw contacts rather than a hit/no-hit answer — currently
+    /// <see cref="ContactCatalog"/>, so it does not duplicate the
+    /// <see cref="FreeCastContext"/> plumbing <see cref="Sweep"/> and
+    /// <see cref="Beams"/> already own.</summary>
+    public static bool CastFront(FieldDirectionService.FlatDir forward, float reach, out ManagedObject result)
+    {
+        result = null;
+        if (!forward.Ok || reach <= 0f) return false;
+        if (!FreeCastContext(out var state, out result, out int originRay)) return false;
+        return FieldNavSideRays.TryCastDirection(state, result, _filterId, originRay, forward.X, forward.Z,
+                                                 reach, out float _);
+    }
+
+    /// <summary>Am I stopped, and will the game climb what is ahead by itself? Both
+    /// answers come from <see cref="FieldNavVerdictService"/> — the game's own
+    /// collision verdict — never from the ray ladder, which cannot tell "there is
+    /// geometry along this segment" from "you cannot go forward".
+    ///
+    /// <para>Priority: a wall contact the game reports wins; failing that, an obstacle
+    /// the game's own auto-step check has claimed is re-described as a
+    /// <see cref="FrontProfile.Step"/>, because the player walks over it without
+    /// doing anything; otherwise the ladder's class stands as a DESCRIPTION of what
+    /// lies ahead and nothing is blocking.</para>
+    ///
+    /// <para>When no game-owned route binds at all, the old behaviour is kept
+    /// verbatim — any hit in the height stack counts as blocked — so a radar that
+    /// cannot reach the verdict is the previous radar, not a silent one. The verdict
+    /// service logs that case as a warning.</para></summary>
+    private static FrontBlock Verdict(ManagedObject avatar, ManagedObject state, ref FrontProfile front)
+    {
+        var v = FieldNavVerdictService.Read(avatar, state);
+
+        // "The game will climb this by itself" is an answer in its own right, and it
+        // holds whether or not a wall route bound — so it is applied first and ends
+        // the question: nothing that the avatar surmounts on its own is a block.
+        if (v.Steppable) { front = FrontProfile.Step; return FrontBlock.None; }
+        if (v.Bound) return v.Block;
+        return front == FrontProfile.Open ? FrontBlock.None : FrontBlock.Blocked;
     }
 
     /// <summary>Both sides, at the longest reach available. The extended probe is
@@ -217,7 +344,7 @@ public static class FieldNavRadarService
     /// <summary>The closest contact along the ray just cast. <c>CastRayAll</c>
     /// returns every surface the segment crosses and makes no ordering promise, so
     /// the minimum is taken rather than contact 0.</summary>
-    private static float NearestContact(ManagedObject result, uint count)
+    internal static float NearestContact(ManagedObject result, uint count)
     {
         _getContactPoint ??= result.GetTypeDefinition()?.GetMethod("getContactPoint(System.UInt32)");
         if (_getContactPoint == null) return 0f;
@@ -236,16 +363,29 @@ public static class FieldNavRadarService
         return best;
     }
 
-    /// <summary>The engine's own hit distance off a contact point, through a getter
-    /// cached on first use — this runs several times a second, so the generic
-    /// member walk is only the fallback for when the getter cannot be bound.</summary>
-    private static float ContactDistance(object cp)
+    /// <summary>The engine's own hit distance off a contact point, through the
+    /// FIELD, cached on first use. <c>via.physics.ContactPoint</c> has no
+    /// <c>get_Distance</c>: asking for one logged "Method not found: get_Distance"
+    /// 73,591 times in one seven-minute session (2026-09-07) because the generic
+    /// member walk tries the getter before the field on every contact of every
+    /// cast. The walk stays as the one-time fallback for a build where the field
+    /// cannot be bound either.</summary>
+    internal static float ContactDistance(object cp)
     {
         if (cp is UnifiedObject uo)
         {
-            _contactDistance ??= uo.GetTypeDefinition()?.GetMethod("get_Distance");
-            if (_contactDistance != null)
-                return FieldProbeService.ToFloat(_contactDistance.InvokeBoxed(typeof(float), uo, null));
+            if (!_contactDistanceProbed)
+            {
+                _contactDistanceProbed = true;
+                var td = uo.GetTypeDefinition();
+                _contactDistanceField = td?.GetField("Distance");
+                _contactDistanceIsValue = cp is REFrameworkNET.ValueType;
+                if (_contactDistanceField == null)
+                    API.LogWarning("[SF6Access] Nav radar: ContactPoint.Distance field not found, using the slow member walk");
+            }
+            if (_contactDistanceField != null)
+                return FieldProbeService.ToFloat(
+                    _contactDistanceField.GetDataBoxed(typeof(float), uo.GetAddress(), _contactDistanceIsValue));
         }
         return FieldProbeService.ToFloat(FieldProbeService.Member(cp, "Distance", typeof(float)));
     }

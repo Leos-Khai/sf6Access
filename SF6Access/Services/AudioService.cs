@@ -85,7 +85,11 @@ public static class AudioService
     /// divided by <paramref name="rate"/>, or <see cref="TimeSpan.Zero"/> if nothing
     /// was queued. A caller that repeats a cue spaces its repeats from this instead
     /// of hard-coding the file's duration.</returns>
-    public static TimeSpan PlaySound(string fileName, float pan = 0f, float volume = 0.5f, float rate = 1f)
+    /// <summary>The mixer's default cue level: half scale, loud enough over the
+    /// game's street ambience, under the reader's voice.</summary>
+    public const float DEFAULT_VOLUME = 0.5f;
+
+    public static TimeSpan PlaySound(string fileName, float pan = 0f, float volume = DEFAULT_VOLUME, float rate = 1f)
     {
         if (!_initialized || _mixer == null || _soundsDir == null) return TimeSpan.Zero;
         rate = Math.Clamp(rate, MinPlaybackRate, MaxPlaybackRate);
@@ -162,6 +166,15 @@ public static class AudioService
     public const float NoteLa = 440.00f;      // A4
     public const float NoteMi = 659.25f;      // E5  (A4 * 2^(7/12))
     public const float NoteLaHigh = 880.00f;  // A5  (A4 octave up)
+
+    // A SECOND, non-overlapping register. The radar has two tone channels — the
+    // approach ladder and the stairs motif — and when both drew on the A/E set above
+    // they were built from the same three notes in opposite order, which a player
+    // reported as literally the same sound. These share no frequency with them, so the
+    // two channels cannot be confused whatever order they are played in.
+    public const float NoteDoLow = 261.63f;   // C4  (A4 * 2^(-9/12))
+    public const float NoteFaLow = 349.23f;   // F4  (A4 * 2^(-4/12))
+    public const float NoteDo = 523.25f;      // C5  (A4 * 2^(3/12))
 
     private const float NoteDuration = 0.18f; // seconds per note (soft, short)
 

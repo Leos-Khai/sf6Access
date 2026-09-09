@@ -23,11 +23,14 @@ other files in `docs/`. For per-screen type/field reference see [`sf6-screens.md
 - `FindFlowParam(typeName)` / `FindActiveParam` — iterate `UIFlowManager._Handles` to find a screen's
   flow param by type FullName.
 - `TrackFlowParam(type, cached, out changed)` — the **stale-param re-entry** helper (see below).
-- Field reads: `GetObjectField` (plain + `k__BackingField`), `ReadIntField`, `ReadBoolField`,
+- Field reads: `GetObjectField` (field → getter → `k__BackingField`), `ReadMember` (same, but keeps
+  REFramework's boxing so **struct members** like `via.vec3` survive), `ReadIntField`, `ReadBoolField`,
   `ReadShortField` (typeof(short)), `ReadByteField`. **Use the width-correct reader** — reading a
   `short`/`byte` field as int pulls adjacent bytes and yields garbage.
-- `Call` / `CallInt` — `IObject.Call` wrappers; dispatch fine on concrete instances even when
-  interface *property getters* don't.
+- `Call` / `CallInt` — method dispatch on concrete instances (works even when interface *property
+  getters* don't). Same lookup `IObject.Call` performs (`FindMethod` on the object's own
+  TypeDefinition, then invoke), but resolved through `MemberAccess` so a method a type does not
+  declare is reported once and never asked for again.
 - Guid resolution: `ResolveGuid` (200 ms timeout — `via.gui.message.get()` crashes on some Guids),
   `ResolveGuidField`, `CleanTags`, `SpeakableIcons` (keeps input-tag content as speech),
   `ResolvePlatformTags` (`<PLATMSG>` via `app.MessageManager.ExchangePlatformMessage`).
@@ -54,6 +57,21 @@ other files in `docs/`. For per-screen type/field reference see [`sf6-screens.md
   Consequence: for runs of identical rows ("Empty"/"Slot"), make each utterance DISTINCT (append the
   slot/preset number or position) or the filter collapses them.
 - Every `Speak` is logged (`Speak(interrupt|queue): text`) — ground truth for diagnosing double reads.
+
+### `Services/MemberAccess.cs` — one TDB lookup per (concrete type, member)
+The resolver every hot read goes through: `FindMethod` (the same lookup `IObject.Call` performs),
+`DeclaredMember` (field → getter → backing field, the order `IObject.GetField` uses) and
+`InheritedMember` (getter → field at every level of the hierarchy, what `FieldProbeService.Member`
+needs). **One lookup per name is the whole search:** `TypeDefinition.GetMethod` *is* `FindMethod`, and
+the native `RETypeDefinition::get_method`/`get_field` both walk `get_parent_type()` themselves — so
+inherited members resolve from the derived type, and hand-rolled `ParentType` loops (as in the old
+`FieldDirectionService.HasMember`) were never necessary. (`get_method` also has a second pass matching
+full prototype strings; that does not license `Call(obj, "sig(...)")` — see the signature-string gotcha
+below, which is an observed runtime result and stands.)
+Keyed on the type's **FullName**, never a process-wide latch: the camera manager, the avatar
+field state and the flow params change type between screens and areas. TDB metadata is static, so the
+answer — including "this type does not have it" — is good for the process; only `Field`/`Method`
+handles are cached, never an engine object. A miss is logged once, naming type and member.
 
 ### Other services
 - `GameStateTracker.cs` — change detection (avoid spam); ~2.5 s state expiry.
@@ -127,6 +145,23 @@ keeps the adapter active).
 - **Interface property getters (`get_X`) return null/empty on concrete IL2CPP types** — read the
   FIELD directly (`GetField` + `GetDataBoxed`). `FlowHelper.Call` / `GetSelected*` still *dispatch*
   fine on concrete instances; it's only typed-proxy property getters that bite.
+- **`IObject.GetField(name)` is not a field read, and a miss is not free.** Its real body
+  (`UnifiedObject.hpp`) is `FindField(name)`, and on a miss `HandleInvokeMember_Internal("get_" + name)`.
+  Both halves log — `Member not found: X` / `Method not found: get_X` — and the getter half, when it
+  HITS, actually **invokes** the property and boxes the result. So the idiom
+  `GetField(name) ?? GetField("<name>k__BackingField") ?? Call("get_" + name)` can log three lines and
+  invoke the same getter **twice** while returning a perfectly good value on the last attempt. Two
+  consequences: (a) it flooded `re2_framework_log.txt` (measured 2026-09-09: 6,966 of 9,398 lines in
+  89 s), and (b) every discarded box is a finalizable wrapper whose `Release` runs on the **GC thread**
+  — the thread of the `ManagedObject.Internal_Finalize` `AccessViolationException`. **Route hot reads
+  through `Services/MemberAccess.cs`**, which resolves field / getter / backing field ONCE per
+  *concrete type FullName* + member (positive **and** negative) and reports a miss once.
+- **A value-typed member read with `GetObjectField` always looks "missing".** `GetObjectField` casts to
+  `ManagedObject`; a `via.vec3` getter returns a `REFrameworkNET.ValueType`, so the cast yields null
+  however well the read went. This is exactly why the camera-forward guard in `FieldDirectionService`
+  never tripped: `HasMember` asked the TYPE (getter present → "it exists") while `ReadVec` asked
+  `GetObjectField` (cast fails → "it's missing"), and the two disagreed forever. **For a struct member
+  use `FlowHelper.ReadMember`**, which keeps REFramework's own boxing.
 - `UIFlowManager._Handles` is a **field**, not a property; iterate it, **newest first** (pick first match).
 - `IObject.Call` with a full signature string (`"getChildren(System.Type)"`) does **not** resolve —
   use `TypeDefinition.GetMethod(sig).InvokeBoxed`.
@@ -187,10 +222,44 @@ keeps the adapter active).
   `CreateInstance(0)` and **not** globalized. It also returns strictly more —
   `NumContactPoints` + `getContactPoint(i)` → `via.physics.ContactPoint` (Position/Normal/Distance/
   TimeOfImpact), returned BY VALUE and boxed by REFramework, so no caller buffer is involved at all.
-- **Don't `Globalize()` a buffer the engine writes into.** `Globalize` is an `AddRef` with no inverse
-  besides `Release`, so it roots the object forever (a leak per probe run) and keeps a possibly-damaged
-  object alive for later traversal. Out buffers live for one synchronous call inside a single frame and
-  need no rooting at all.
+- **Never `CreateInstance` an interface, abstract class or generic instantiation.** REFramework's
+  `CreateInstance` has no guard: it hands the type to the game's `System.Activator` and wraps whatever
+  qword comes back in a `ManagedObject` (see the object-lifetime entry below for what that object's
+  lifetime actually is). For `IList<ContactedWallInfo>` that was a wrapper over a non-object, and the
+  game died minutes later with `AccessViolationException` in `ManagedObject.Finalize` on the GC finalizer
+  thread (2026-09-06), with **nothing** in `re2_framework_log.txt`. `FieldProbeService.NewInstance` now
+  refuses value types, generic types (`TypeDefinition.IsGenericType()`) and, via the game's own
+  `System.Type`, `get_IsInterface` / `get_IsAbstract`. Always construct through it. A silent AV in the
+  finalizer with a clean log means "a wrapper was built around something that is not a live managed
+  object".
+- **A `CreateInstance`d object is a LOCAL object that nothing AddRefs — reusing the container is unsafe
+  at ANY rate unless you `Globalize()` it.** Per Capcom's own *"Achieve Rapid Iteration: RE ENGINE
+  Design"*, quoted in REFrameworkNET's `ManagedObject.hpp`: a local object "can only be referenced by the
+  spawned thread", is "registered in the local table for each thread" under a **negative** reference
+  count (an index into that table), and "all objects created from C# will be local objects."
+  `AddRefIfGlobalized` bails because the object was never globalized, so nothing keeps it alive and the
+  engine's frame GC can reclaim it out from under a live C# reference. This is what actually crashed a
+  reused `via.physics.CastRayResult` in `FieldRayCaster` three different ways on 2026-09-09 — one per
+  cast at 450/s, one per process without globalizing, one per sweep at 30/s, all three fatal — before the
+  real fix was found (full account in STATUS.md): `FieldProbeService.SharedInstance(TypeDefinition)`
+  creates one instance per type and **`Globalize()`s** it once, cached in a static dictionary for the
+  process lifetime. `Globalize` AddRefs, which takes the reference count positive and promotes the object
+  out of the per-thread local table, so the engine stops reclaiming it — REFrameworkNET's own docs for
+  `Globalize` prescribe exactly this case ("manually creating an instance of a managed object"). Because
+  the wrapper is then never collected, its finalizer never runs, so the GC-thread
+  `Internal_Finalize`/`AccessViolationException` above cannot happen at all. Guard: refuse and log the
+  container if `GetReferenceCount()` isn't positive after globalizing. Use `SharedInstance` for any
+  `CreateInstance` container reused across more than one call; `NewInstance` stays correct only for a
+  true one-shot (a single diagnostic dump, not a per-frame or per-cast loop). Also: `AccessViolationException`
+  is a corrupted-state exception — **.NET Core does not let `catch (Exception)` catch it** — so a
+  try/catch around the calling code is not a safety net here; the only guard that works is not making the
+  unsafe call.
+- **Don't `Globalize()` a raw out-buffer** (`FieldOutBuffer`, `NativeObject.FromAddress` over
+  `Marshal.AllocHGlobal` memory) — it isn't a local IL2CPP object, `Globalize` roots it forever for no
+  benefit (a leak per probe run), and it lives for one synchronous call inside a single frame, so it
+  needs no rooting at all. This is unrelated to `SharedInstance`'s use of `Globalize()` on a reused
+  `CreateInstance` container (`CastRayResult`, above) — that IS a local IL2CPP object, and globalizing it
+  is the fix, not a hazard.
 - **`AvatarBase` has no `DrawObj`** — in the decompiled source `DrawObj` only exists inside the nested
   per-body-part `WTBodyDisp` struct. Reach an avatar's transform through its own
   `Component.get_GameObject()` → `get_Transform()` → `get_Position()`.

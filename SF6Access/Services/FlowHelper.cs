@@ -310,13 +310,46 @@ public static partial class FlowHelper
         catch { return 0; }
     }
 
-    /// <summary>Read an object field, trying the plain name and the auto-property backing field.</summary>
+    /// <summary>Read an object field, trying the plain name, the property getter
+    /// and the auto-property backing field — the same three shapes
+    /// <c>IObject.GetField</c> would try, except that <see cref="MemberAccess"/>
+    /// has already worked out which of them this concrete type actually has, so
+    /// the ones it does not have are never asked for again.</summary>
     public static ManagedObject GetObjectField(ManagedObject obj, string name)
     {
-        if (obj == null) return null;
-        try { var v = obj.GetField(name) as ManagedObject; if (v != null) return v; } catch { }
-        try { return obj.GetField($"<{name}>k__BackingField") as ManagedObject; } catch { }
+        foreach (var accessor in Accessors(obj, name, out ulong address))
+        {
+            try { if (accessor.Read(obj, address, null, false) is ManagedObject v) return v; }
+            catch { }
+        }
         return null;
+    }
+
+    /// <summary>Read a member as REFramework boxed it: a <c>ManagedObject</c> for a
+    /// reference member, a <c>REFrameworkNET.ValueType</c> for a struct one.
+    /// <see cref="GetObjectField"/> can only ever answer the first kind, so an
+    /// engine vector (<c>via.vec3</c>) read through it reports "missing" however
+    /// well the read went — use this instead.</summary>
+    public static object ReadMember(ManagedObject obj, string name)
+    {
+        foreach (var accessor in Accessors(obj, name, out ulong address))
+        {
+            try { var v = accessor.Read(obj, address, null, false); if (v != null) return v; }
+            catch { }
+        }
+        return null;
+    }
+
+    private static MemberAccess.Accessor[] Accessors(ManagedObject obj, string name, out ulong address)
+    {
+        address = 0;
+        if (obj == null) return MemberAccess.None;
+        try
+        {
+            address = AddressOf(obj);
+            return MemberAccess.DeclaredMember(obj.GetTypeDefinition(), name);
+        }
+        catch { return MemberAccess.None; }
     }
 
     public static int ReadIntField(ManagedObject obj, string name, int fallback = -1)
@@ -504,11 +537,26 @@ public static partial class FlowHelper
         return _displayFuncExists;
     }
 
-    /// <summary>Call a method declared on the object's own class (not an interface). Returns null on failure.</summary>
+    /// <summary>Call a method declared on the object's own class (not an interface).
+    /// Returns null on failure.
+    /// <para>Resolved through <see cref="MemberAccess"/> rather than
+    /// <c>IObject.Call</c>, which is the same lookup (<c>FindMethod</c> on the
+    /// object's own TypeDefinition, then invoke) except that it repeats — and logs
+    /// — the lookup on every call. A method a concrete type does not declare is
+    /// reported once and skipped from then on.</para></summary>
     public static object Call(ManagedObject obj, string methodName, params object[] args)
     {
         if (obj == null) return null;
-        try { return (obj as IObject)?.Call(methodName, args); }
+        try
+        {
+            var method = MemberAccess.FindMethod(obj.GetTypeDefinition(), methodName);
+            if (method == null) return null;
+            // args is handed on untouched, exactly as IObject.Call hands it to the
+            // same Method.Invoke_Internal. A null target return type is what makes
+            // the boxed result identical to Call's (Utility::TranslateBoxedData
+            // returns the value unchanged when no type is named).
+            return method.InvokeBoxed(null, obj, args);
+        }
         catch { return null; }
     }
 

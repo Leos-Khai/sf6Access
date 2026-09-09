@@ -47,7 +47,10 @@ public class MissionBeaconHooks
 
     // Below this the objective is effectively reached; the game takes over with
     // its own prompt, so the beacon goes quiet rather than talking over it.
-    private const float ARRIVED_M = 4f;
+    // Internal (not private): FieldTrackingHooks reuses it as the floor for its
+    // own distance-band ladder instead of inventing a second "close enough"
+    // radius for the same avatar field.
+    internal const float ARRIVED_M = 4f;
 
     private const long READER_HOLD_MS = 1200;
 
@@ -74,6 +77,11 @@ public class MissionBeaconHooks
     // moves between resolves while the player and the camera move constantly.
     private static bool _haveFix;
     private static float _fixX, _fixY, _fixZ;
+
+    /// <summary>True while the beacon has an objective to pulse toward. The NPC
+    /// homing beacon yields while this is up: two homing pulses at once would be
+    /// two directions at once.</summary>
+    internal static bool Homing => _haveFix;
 
     [PluginEntryPoint]
     public static void Initialize()

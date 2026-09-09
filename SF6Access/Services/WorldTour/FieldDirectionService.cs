@@ -23,7 +23,7 @@ namespace SF6Access.Services.WorldTour;
 public static class FieldDirectionService
 {
     // Clock-face geometry: 12 hours over 360°.
-    private const float DEGREES_PER_HOUR = 360f / 12f;
+    public const float DEGREES_PER_HOUR = 360f / 12f;
 
     // Below this squared XZ length a direction has no usable heading (a camera
     // looking straight down projects to ~zero, a target standing on top of the
@@ -116,12 +116,20 @@ public static class FieldDirectionService
         return new FlatDir(x / len, z / len, true);
     }
 
+    /// <summary>One engine vector member, flattened to its XZ pair.
+    /// <para><b>Read it as a MEMBER, not as an object field.</b> The camera pair are
+    /// <c>via.vec3</c> properties: <c>FlowHelper.GetObjectField</c> casts what it
+    /// reads to <c>ManagedObject</c>, and a value type never is one, so it reported
+    /// "missing" on every call while the value itself was fine — the read only
+    /// succeeded on the <c>Call("get_...")</c> fallback behind it, after two dead
+    /// field probes and one discarded getter invocation. <see cref="FlowHelper.ReadMember"/>
+    /// keeps REFramework's own boxing, so the vector arrives on the first
+    /// try.</para></summary>
     private static (float x, float z, bool ok) ReadVec(ManagedObject owner, string prop)
     {
         try
         {
-            var boxed = (object)FlowHelper.GetObjectField(owner, prop)
-                        ?? FlowHelper.Call(owner, "get_" + prop);
+            var boxed = FlowHelper.ReadMember(owner, prop);
             if (boxed == null) return (0f, 0f, false);
             float x = FlowHelper.ReadVecComponent(boxed, "x");
             float z = FlowHelper.ReadVecComponent(boxed, "z");

@@ -43,6 +43,11 @@ public class FieldAwarenessHooks
     private static string _pendingTarget;
     private static int _pendingPolls;
 
+    // The interactable last ANNOUNCED, so walking out of its range can be
+    // spoken as "leaving X" (user request 2026-09-07: a counter or a door
+    // left behind in silence is a counter the player no longer knows about).
+    private static string _announcedTarget;
+
     // How many neighbours the on-demand readout names before summarising the
     // rest. In a busy hub the full list is unusable; the remainder is always
     // counted out loud rather than silently dropped.
@@ -111,6 +116,7 @@ public class FieldAwarenessHooks
             // reads the surroundings out again.
             GameStateTracker.Remove(CURRENT_TARGET_KEY);
             GameStateTracker.Remove(SECTION_KEY);
+            _announcedTarget = null;
             _arrivalPending = false;
             _pollCounter = 0;
             return;
@@ -201,6 +207,12 @@ public class FieldAwarenessHooks
         if (list.Count == 0)
         {
             GameStateTracker.Remove(CURRENT_TARGET_KEY);
+            // Out of range of what was announced: say so once. A target that
+            // is REPLACED by a nearer one is not "left", the new arrival covers
+            // it, so only the empty list speaks.
+            if (_announcedTarget != null)
+                ScreenReaderService.Speak(LocalizedText.LeavingTarget(_announcedTarget), interrupt: false);
+            _announcedTarget = null;
             return;
         }
 
@@ -221,7 +233,10 @@ public class FieldAwarenessHooks
         if (_pendingPolls < TARGET_STABLE_POLLS) { _pendingPolls++; return; }
 
         if (GameStateTracker.HasChanged(CURRENT_TARGET_KEY, spoken))
+        {
             ScreenReaderService.Speak(spoken, interrupt: false);
+            _announcedTarget = spoken;
+        }
     }
 
     /// <summary>On-demand: list the nearby interactables, nearest first. The

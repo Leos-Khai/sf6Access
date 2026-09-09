@@ -26,14 +26,22 @@ public sealed class ReadoutShortcut
     /// shop menus.</summary>
     public const uint PAD_START = 0x8000;
 
+    /// <summary>Virtual-key code of Shift (either side), for chorded shortcuts.</summary>
+    private const int VK_SHIFT = 0x10;
+
     private readonly int _vk;
     private readonly uint _padFlag;
+    private readonly bool _shift;
     private bool _lastKey, _lastPad;
 
-    public ReadoutShortcut(int vk = VK_G, uint padFlag = PAD_START)
+    /// <param name="shift">When true the key fires only WITH Shift held, and a
+    /// plain press of the same key is left to whichever shortcut owns it — the
+    /// two never fire together.</param>
+    public ReadoutShortcut(int vk = VK_G, uint padFlag = PAD_START, bool shift = false)
     {
         _vk = vk;
         _padFlag = padFlag;
+        _shift = shift;
     }
 
     [DllImport("user32.dll")]
@@ -48,7 +56,8 @@ public sealed class ReadoutShortcut
     {
         bool fired = false;
 
-        bool key = (GetAsyncKeyState(_vk) & 0x8000) != 0;
+        bool key = (GetAsyncKeyState(_vk) & 0x8000) != 0
+                   && ((GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0) == _shift;
         if (key && !_lastKey && IsGameForeground()) fired = true;
         _lastKey = key;
 

@@ -77,17 +77,99 @@ public static class FieldProbeService
     /// shape as every other engine method taking an object, and the object is sized
     /// and laid out by the engine's own allocator, never by us.
     ///
-    /// <para>Deliberately NOT globalized: it lives for one synchronous call inside a
-    /// single frame. Rooting it would leak one object per probe run and keep it alive
-    /// for the GC to walk long after the call that filled it — and globalizing an
-    /// object the engine has just written through is how a silent failure becomes a
-    /// delayed crash.</para></summary>
+    /// <para><b>What comes back is a LOCAL object, and that is the whole problem.</b>
+    /// <c>CreateInstance</c> invokes the game's own <c>System.Activator</c> on the
+    /// CALLING thread's VM context, and RE Engine's object model — Capcom's own
+    /// "Achieve Rapid Iteration: RE ENGINE Design" — says a local object "can only be
+    /// referenced by the spawned thread", is "registered in the local table for each
+    /// thread", carries a NEGATIVE reference count that is an index into that table,
+    /// and that "all objects created from C# will be local objects". The engine's frame
+    /// GC reclaims it. Nothing AddRefs it, so nothing keeps it alive.</para>
+    ///
+    /// <para>Two consequences, both paid for in play on 2026-09-09. Let one live past
+    /// the frame that made it and the engine reclaims it underneath you — the next cast
+    /// writes into freed memory. Let it die instead and REFramework's finalizer
+    /// dereferences the reclaimed object from the GC THREAD, which is
+    /// <c>AccessViolationException at ManagedObject.Internal_Finalize</c>, uncatchable
+    /// and instantly fatal. Rate only changes how long you last.</para>
+    ///
+    /// <para>So a caller that needs a container across frames — every result buffer
+    /// here does — must use <see cref="SharedInstance"/>, which globalizes. This method
+    /// is for an object genuinely consumed inside the frame that made it.</para></summary>
     public static ManagedObject NewInstance(TypeDefinition td)
     {
-        if (td == null || td.IsValueType()) return null;
+        // REFramework's CreateInstance has NO guard: it asks the game's Activator and
+        // wraps whatever qword comes back. For an interface, an abstract class or a
+        // generic instantiation that is a wrapper over a non-object and a delayed
+        // AccessViolationException on the finalizer thread (seen 2026-09-06). Only a
+        // concrete, non-generic reference type is constructible; the game's own
+        // System.Type answers the rest.
+        if (td == null || td.IsValueType() || td.IsGenericType()) return null;
+        var runtimeType = td.GetRuntimeType();
+        if (runtimeType == null) return null;
+        if (FlowHelper.Call(runtimeType, "get_IsInterface") is bool isInterface && isInterface) return null;
+        if (FlowHelper.Call(runtimeType, "get_IsAbstract") is bool isAbstract && isAbstract) return null;
         try { return td.CreateInstance(0); }
         catch { return null; }
     }
+
+    /// <summary>One GLOBALIZED instance of a type, created on first use and held for
+    /// the process — the safe way to own an engine-written result container.
+    ///
+    /// <para><see cref="NewInstance"/> yields a local object the engine's frame GC
+    /// reclaims (see its remarks). <c>Globalize</c> is REFramework's answer to exactly
+    /// this: its own documentation says it "should only need to be called" when "you
+    /// are manually creating an instance of a managed object", which is precisely this
+    /// call. It AddRefs, taking the reference count positive, which in RE Engine's model
+    /// is what promotes a per-thread local object to one that every thread may hold —
+    /// so the engine stops reclaiming it and the container survives the frame.</para>
+    ///
+    /// <para>Held in this table forever, deliberately. A rooted object is not a leak
+    /// when there is exactly one per type and it is reused for the life of the process;
+    /// it is the difference between thirty allocations a second and none. Because it is
+    /// never collected, its finalizer never runs, so the GC-thread dereference that has
+    /// been killing the game cannot happen at all — the crash surface is removed, not
+    /// narrowed.</para>
+    ///
+    /// <para>Callers must still reset the container themselves (the cast API's own
+    /// <c>clear</c>) before each use: it is shared across every call for that type.
+    /// A wrapper whose reference count has gone non-positive is re-acquired rather than
+    /// used, which should never happen to a globalized object and is the cheap check
+    /// that says so if it does.</para></summary>
+    public static ManagedObject SharedInstance(TypeDefinition td)
+    {
+        string key = td?.FullName;
+        if (key == null) return null;
+        if (_shared.TryGetValue(key, out var held) && held != null && Globalized(held)) return held;
+
+        var made = NewInstance(td);
+        if (made == null) return null;
+        try { made.Globalize(); }
+        catch (Exception ex)
+        {
+            API.LogWarning($"[SF6Access] Could not globalize {key}: {ex.GetType().Name}. " +
+                           "Refusing it — an engine object that cannot be rooted is not safe to keep.");
+            return null;
+        }
+        if (!Globalized(made))
+        {
+            API.LogWarning($"[SF6Access] Globalize({key}) left the reference count non-positive — refused.");
+            return null;
+        }
+        _shared[key] = made;
+        API.LogInfo($"[SF6Access] Shared engine container {key} created and globalized (one for the process).");
+        return made;
+    }
+
+    /// <summary>A positive reference count is what "global" means in RE Engine's model;
+    /// a negative one is an index into a per-thread local table.</summary>
+    private static bool Globalized(ManagedObject obj)
+    {
+        try { return obj.GetReferenceCount() > 0; }
+        catch { return false; }
+    }
+
+    private static readonly Dictionary<string, ManagedObject> _shared = new();
 
     /// <summary>The float the engine wrote into a one-float out buffer. The
     /// primitive's own TDB entry names its storage field, so read that; the direct
@@ -136,25 +218,26 @@ public static class FieldProbeService
     public static object Member(object owner, string name, System.Type expected = null)
     {
         if (owner == null) return null;
-        try { var v = (owner as IObject)?.Call("get_" + name); if (v != null) return v; }
-        catch { }
+
+        // The untyped getter, but only when the CONCRETE type declares it: asking
+        // IObject.Call for a method a type does not have costs a logged
+        // "Method not found" line on every single read, and these members are read
+        // several times a second (measured 606 lines in 89 s from the wall and
+        // collision members alone). The miss is not reported here — the hierarchy
+        // walk below is the rest of the search and returns the verdict.
+        if (MemberAccess.FindMethod((owner as IObject)?.GetTypeDefinition(), "get_" + name, logMiss: false) != null)
+        {
+            try { var v = (owner as IObject)?.Call("get_" + name); if (v != null) return v; }
+            catch { }
+        }
 
         if (!(owner is UnifiedObject uo)) return null;
         bool valueContainer = owner is REFrameworkNET.ValueType;
         System.Type want = expected ?? typeof(object);
-        for (var td = uo.GetTypeDefinition(); td != null; td = td.ParentType)
+        ulong address = uo.GetAddress();
+        foreach (var accessor in MemberAccess.InheritedMember(uo.GetTypeDefinition(), name))
         {
-            try
-            {
-                var m = td.GetMethod("get_" + name);
-                if (m != null) { var v = m.InvokeBoxed(want, uo, null); if (v != null) return v; }
-            }
-            catch { }
-            try
-            {
-                var f = td.GetField(name) ?? td.GetField($"<{name}>k__BackingField");
-                if (f != null) { var v = f.GetDataBoxed(want, uo.GetAddress(), valueContainer); if (v != null) return v; }
-            }
+            try { var v = accessor.Read(uo, address, want, valueContainer); if (v != null) return v; }
             catch { }
         }
         return null;
@@ -193,6 +276,117 @@ public static class FieldProbeService
         if (go == null) return "(level geometry / no GameObject)";
         string n = FlowHelper.Call(go as ManagedObject, "get_Name") as string;
         return string.IsNullOrEmpty(n) ? "(unnamed)" : n;
+    }
+
+    /// <summary>via.physics.System.getLayerName(uint), resolved once and cached as a
+    /// TDB method handle (never an engine object) — the same lookup
+    /// <see cref="FieldFilterProbe"/> makes for the filter table, kept separate
+    /// because this probe reads a <c>Collidable</c>'s OWN <c>FilterInfo</c> rather
+    /// than the collision system's per-<c>eFilterInfo</c> table.</summary>
+    private static Method _getLayerName;
+    private static bool _getLayerNameResolved;
+
+    private static Method GetLayerNameMethod()
+    {
+        if (_getLayerNameResolved) return _getLayerName;
+        _getLayerNameResolved = true;
+        try { _getLayerName = TDB.Get().FindType("via.physics.System")?.GetMethod("getLayerName(System.UInt32)"); }
+        catch { _getLayerName = null; }
+        return _getLayerName;
+    }
+
+    /// <summary>A <c>via.physics.Collidable</c>'s filter, in one line: numeric
+    /// <c>Layer</c>/<c>Group</c>/<c>SubGroup</c> plus the layer's own NAME from
+    /// <c>via.physics.System.getLayerName(uint)</c> — never guessed at by id, and
+    /// never printed at all when the collidable itself is null (a contact against
+    /// static level geometry with no <c>Collidable</c>).</summary>
+    public static string Collidable(object coll)
+    {
+        if (coll == null) return "";
+        try
+        {
+            var filter = Member(coll, "FilterInfo");
+            if (filter == null) return " layer=? grp=?/?";
+            uint layer = ToUInt(Member(filter, "Layer", typeof(uint)));
+            uint group = ToUInt(Member(filter, "Group", typeof(uint)));
+            uint sub = ToUInt(Member(filter, "SubGroup", typeof(uint)));
+            string layerName = "?";
+            try { layerName = GetLayerNameMethod()?.InvokeBoxed(typeof(string), null, new object[] { layer }) as string ?? "?"; }
+            catch { }
+            return FormattableString.Invariant($" layer={layer}({layerName}) grp={group}/{sub}");
+        }
+        catch { return " layer=? grp=?/?"; }
+    }
+
+    /// <summary>A contact's <c>Material</c> (<c>via.physics.MaterialInfo</c>): the
+    /// surface id plus its three attribute bytes, read individually so one missing
+    /// member never blanks the rest.</summary>
+    public static string MaterialText(object cp)
+    {
+        if (cp == null) return "";
+        object mat = null;
+        try { mat = Member(cp, "Material"); } catch { }
+        if (mat == null) return " mat=? attr=?/?/?";
+        uint id = ToUInt(SafeMember(mat, "Id"));
+        uint a1 = ToUInt(SafeMember(mat, "Attribute1"));
+        uint a2 = ToUInt(SafeMember(mat, "Attribute2"));
+        uint a3 = ToUInt(SafeMember(mat, "Attribute3"));
+        return FormattableString.Invariant($" mat={id} attr={a1}/{a2}/{a3}");
+    }
+
+    /// <summary>The GameObject's <c>Folder</c> name and <c>Tag</c> string — empty
+    /// string, not a placeholder, when the GameObject itself is null (level
+    /// geometry with no GameObject at all).</summary>
+    public static string GameObjectFolderAndTag(object go)
+    {
+        if (go == null) return "";
+        string folder = "?", tag = "?";
+        try
+        {
+            var folderObj = Member(go, "Folder");
+            folder = folderObj == null ? "(none)" : (FlowHelper.Call(folderObj as ManagedObject, "get_Name") as string ?? "?");
+        }
+        catch { }
+        try { tag = (SafeMember(go, "Tag") as string) ?? ""; } catch { }
+        return $" folder='{folder}' tag='{tag}'";
+    }
+
+    /// <summary>Up to <see cref="MAX_COMPONENTS_LISTED"/> component type FullNames off
+    /// a GameObject's <c>Components</c> array — this is what tells an interactable
+    /// (an <c>app.worldtour.om.*</c> component) apart from plain geometry.</summary>
+    private const int MAX_COMPONENTS_LISTED = 8;
+
+    public static string GameObjectComponents(object go)
+    {
+        if (go == null) return "";
+        try
+        {
+            var comps = Member(go, "Components") as System.Collections.IEnumerable;
+            if (comps == null) return " comps=[?]";
+            var names = new List<string>();
+            foreach (var c in comps)
+            {
+                if (names.Count >= MAX_COMPONENTS_LISTED) break;
+                try { names.Add((c as UnifiedObject)?.GetTypeDefinition()?.GetFullName() ?? "?"); }
+                catch { names.Add("?"); }
+            }
+            return $" comps=[{string.Join(", ", names)}]";
+        }
+        catch { return " comps=[?]"; }
+    }
+
+    /// <summary>A member read as <c>object</c> rather than a primitive — used for
+    /// string/reference members (<c>Tag</c>, <c>Folder</c>) where forcing a CLR
+    /// primitive type on <see cref="Member"/> would be wrong.</summary>
+    private static object SafeMember(object owner, string name)
+    {
+        try { return Member(owner, name); } catch { return null; }
+    }
+
+    private static uint ToUInt(object boxed)
+    {
+        try { return boxed == null ? 0u : Convert.ToUInt32(boxed); }
+        catch { return 0u; }
     }
 
     // ---------- overload selection ----------

@@ -41,6 +41,12 @@ namespace SF6Access.Services.WorldTour;
 /// each run against the LIVE state object's own type chain — the concrete field
 /// state changes with what the avatar is doing, and a cached binding from a
 /// previous state is exactly the stale handle the house rules warn about.</para>
+///
+/// <para>Each listed contact also records the collidable's filter (layer id, name
+/// and group/subgroup), the contact material's id and attribute bytes, and the
+/// GameObject's folder, tag and component type list — enough to tell an
+/// interactable (an <c>app.worldtour.om.*</c> component) apart from plain level
+/// geometry without a second probe run.</para>
 /// </summary>
 public static class FieldRayProbe
 {
@@ -210,8 +216,14 @@ public static class FieldRayProbe
             object cp = null, coll = null;
             try { cp = getPoint?.InvokeBoxed(typeof(object), result, new object[] { i }); } catch { }
             try { coll = getCollidable?.InvokeBoxed(typeof(object), result, new object[] { i }); } catch { }
+            object go = null;
+            try { go = FieldProbeService.Member(coll, "GameObject"); } catch { }
             sb.AppendLine($"      [{i}] {FieldProbeService.Contact(cp)} " +
-                          $"obj='{FieldProbeService.GameObjectName(FieldProbeService.Member(coll, "GameObject"))}'");
+                          $"obj='{FieldProbeService.GameObjectName(go)}'" +
+                          FieldProbeService.Collidable(coll) +
+                          FieldProbeService.MaterialText(cp) +
+                          FieldProbeService.GameObjectFolderAndTag(go) +
+                          FieldProbeService.GameObjectComponents(go));
         }
         if (count > limit) sb.AppendLine($"      ... {count - limit} more");
     }

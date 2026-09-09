@@ -1,4 +1,4 @@
-# SF6Access — Español. Solo las claves que difieren del inglés (en.txt).
+﻿# SF6Access — Español. Solo las claves que difieren del inglés (en.txt).
 damage=Daño
 price=Precio
 completed=Completado
@@ -842,6 +842,7 @@ wt.contact_master=maestro
 wt.contact_object=objeto
 wt.contact_player=jugador
 wt.at_meters={0} a {1} metros
+wt.leaving=Saliendo de {0}
 wt.at_clock_meters={0} a las {1}, a {2} metros
 wt.clock_short=a las {0}, a {1} metros
 wt.tracking_on=seguimiento activado
@@ -867,16 +868,65 @@ wt.nav_front_step=escalón bajo
 wt.nav_front_waist=obstáculo a la altura de la cintura
 wt.nav_front_wall=pared
 wt.nav_front_tall=pared alta
+wt.nav_front_blocked=bloqueado
+wt.nav_front_wallride=pared por la que puedes correr
 wt.nav_obstacle_at={0} a {1} metros
 wt.nav_clear_for=libre {0} metros
 wt.nav_left_open=izquierda libre
 wt.nav_left_blocked=izquierda bloqueada
 wt.nav_right_open=derecha libre
 wt.nav_right_blocked=derecha bloqueada
+wt.nav_left_clear=izquierda libre {0} metros
+wt.nav_right_clear=derecha libre {0} metros
 wt.nav_floor_solid=suelo delante
 wt.nav_floor_drop=caída delante
+wt.nav_enclosed=espacio cerrado
+wt.nav_exit_front=salida de frente
+wt.nav_exit_left=salida a la izquierda
+wt.nav_exit_right=salida a la derecha
+wt.nav_exit_back=salida detrás
+wt.nav_opening=salida a las {0}, {1} metros de ancho, a {2} metros
+wt.nav_gap_narrow=hueco a las {0}, solo {1} metros de ancho
+wt.nav_no_openings=Ninguna salida al alcance
 
 # --- Zona / área de World Tour ---
 wt.zone_here=en {0}
 wt.zone_near=cerca de {0}
 wt.zone_unknown=ubicación desconocida
+
+# World Tour compass / aim
+wt.dir_n=norte
+wt.dir_ne=noreste
+wt.dir_e=este
+wt.dir_se=sureste
+wt.dir_s=sur
+wt.dir_sw=suroeste
+wt.dir_w=oeste
+wt.dir_nw=noroeste
+wt.facing=mirando al {0}
+wt.aim_ahead={0}, de frente
+wt.sweep_open=abierto: {0}
+wt.sweep_walls=paredes: {0}
+wt.sweep_entry={0} a {1} metros
+wt.sweep_all_open=abierto en todas direcciones
+wt.sweep_unavailable=entorno no disponible
+
+# World Tour phone map (app.UIFlowWTDeviceMap)
+wt.map.state_map=Mapa
+wt.map.state_travel_list=Lista de viaje rápido
+wt.map.state_fast_travel=Viajando
+wt.map.state_failed_travel=No se puede viajar
+wt.map.state_world_map=Mapa del mundo
+wt.map.state_failed_pin=No se puede colocar el marcador
+wt.map.icon_shop=tienda
+wt.map.icon_mission=misión
+wt.map.icon_master=maestro
+wt.map.icon_fast_travel=viaje rápido
+wt.map.icon_merchant=comerciante
+wt.map.icon_challenger=retador
+wt.map.icon_enemy=enemigo
+wt.map.icon_pin=marcador
+wt.map.icon_other=punto de interés
+wt.map.icon_entry={0}, {1}
+wt.map.travel_point={0}, {1} de {2}
+wt.map.location={0}, {1}

@@ -35,8 +35,8 @@ public sealed class HomingCue
 {
     // Playback rate when the target is in the back half of the camera frame:
     // one octave down, the user's own specification.
-    private const float BEHIND_RATE = 0.5f;
-    private const float AHEAD_RATE = 1f;
+    internal const float BEHIND_RATE = 0.5f;
+    internal const float AHEAD_RATE = 1f;
 
     // The repeat interval is measured as the SILENCE BETWEEN repeats, not as a
     // period: the cue lasts as long as the file does, and twice that when it is
@@ -46,10 +46,13 @@ public sealed class HomingCue
     // Near bound: a quarter of a second is about the shortest silence that still
     // reads as two separate pings instead of one stuttering sound.
     private const int GAP_NEAR_MS = 250;
-    // Far bound: three seconds. Slow enough to sit under the beacon's spoken
-    // line without crowding it, quick enough that a wrong turn is audible within
-    // a few steps rather than half a street later.
-    private const int GAP_FAR_MS = 3000;
+    // Far bound: two and a half seconds (three until 2026-09-07, when the user
+    // asked for a slightly quicker loop; the mission sample also lost 1.3 s of
+    // trailing silence the same day, which is where most of the speed-up
+    // came from). Slow enough to sit under the beacon's spoken line without
+    // crowding it, quick enough that a wrong turn is audible within a few
+    // steps rather than half a street later.
+    private const int GAP_FAR_MS = 2500;
 
     // Both are UX pacing choices rather than values the game holds, so they are
     // named here and nowhere else; the distances they interpolate between are
@@ -59,6 +62,7 @@ public sealed class HomingCue
     private readonly float _tightAtM;
     private readonly float _looseFromM;
     private long _nextTick;
+    private int _lastLoggedM = int.MinValue;
 
     /// <param name="fileName">Sound file in the mod's sounds folder.</param>
     /// <param name="tightAtM">Distance at which the repeat is at its fastest —
@@ -83,6 +87,11 @@ public sealed class HomingCue
     /// re-acquiring a target should be heard at once, not after a gap.</summary>
     public void Reset() => _nextTick = 0;
 
+    /// <summary>Stay silent for a while without forgetting anything: for the
+    /// stretches where there is a target but it is out of range, so the caller
+    /// need not re-read positions every frame to find that out again.</summary>
+    public void Snooze(long ms) => _nextTick = Environment.TickCount64 + ms;
+
     /// <summary>Sound one repeat toward the offset <c>(dx, dz)</c> in the given
     /// forward frame, and schedule the next one from <paramref name="dist"/>.</summary>
     public void Sound(FieldDirectionService.FlatDir forward, float dx, float dz, float dist)
@@ -101,6 +110,11 @@ public sealed class HomingCue
             : GAP_FAR_MS;
         _nextTick = Environment.TickCount64 + spacing;
 
+        // One line per metre of progress, not per ping: up close a cue repeats
+        // several times a second and the log has been flooded before.
+        int metres = (int)dist;
+        if (metres == _lastLoggedM) return;
+        _lastLoggedM = metres;
         REFrameworkNET.API.LogInfo(
             $"[SF6Access] Homing cue {_file} at {dist:0.0}m, pan {pan:0.00}, rate {rate:0.0}");
     }

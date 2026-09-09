@@ -679,6 +679,24 @@ exist if ever needed: `app.GUIAccessDataManager.AccessTargetList`
 `OtherPlayer = 3`. Note Luke reads as `Legendary` in the opening tutorial, so he is announced as
 "master", not "person".
 
+### Notable vs. crowd (`Services/WorldTour/AvatarNameCache.cs`, 2026-09-07)
+**A name is not a filter in World Tour.** Session log 2026-09-07 11:55–12:00: the street crowd is
+NAMED and interactable too ("Kenneth, persona", "Susana, persona", every passer-by), so a hands-free
+reader that speaks "anyone with a name" narrates the crowd — the tracker followed a new pedestrian
+every few steps and read out a census. What actually separates the people worth a sentence is the
+game's own contact KIND: `HudDef.ContactUIType != CONTACT_NPC` (a master, another player, or an
+NPC-context-only name) is **notable**; plain `NPC` is the street. The homing pulse (audio only) still
+follows the literal nearest person, crowd included — a sound toward a passer-by is fine, a sentence
+about one is not.
+
+`AvatarNameCache` caches `(name, kind)` per avatar ADDRESS (`AvatarFieldReader.Classify`, `Classify`'s
+`(Name, Kind)` tuple), forgetting an address not seen for `FORGET_MS` = 30 s, so the notable/crowd
+split costs a dictionary lookup instead of a component walk per avatar per poll — neither a person's
+name nor their kind changes for their lifetime. `AvatarNameCache.NameOf` gives the same "{name},
+{kind}" string `AvatarFieldReader.DescribeAvatar` did; `IsNotable`/`Notable(list)` are the filter the
+tracker's voice applies before speaking (the look-sweep deliberately does NOT filter — see § 10). `AvatarFieldReader.CONTACT_NONE` (name from the
+`WTNpcContext` fallback, or no name at all) is never notable.
+
 ### Clock direction (camera-relative)
 `Services/WorldTour/FieldDirectionService.cs`. The announced hour ("person at 2 o'clock, 14 meters",
 `wt.at_clock_meters`) is **camera-relative** — the stick steers relative to the camera, so 12 must mean
@@ -686,7 +704,13 @@ exist if ever needed: `app.GUIAccessDataManager.AccessTargetList`
 - **Camera source: `app.CameraManager`** (global managed singleton, resolved with the same
   stale-rebind `Singleton()` pattern as the WT managers). Forward = `LookAtPosition − CameraPosition`
   projected to XZ — two positions, so no quaternion decomposition and no sign ambiguity; `CameraVec`
-  is the fallback. It also exposes `CameraRotation` (Quaternion) but that's unneeded. The WT-specific
+  is the fallback. It also exposes `CameraRotation` (Quaternion) but that's unneeded. **Confirmed
+  unavailable on this build (2026-09-07):** `CameraPosition`/`LookAtPosition` logged "Member not found"
+  on every read — 2563 lines in one session, once the tracker/sweep/radar readers were all polling at
+  10 Hz. `FieldDirectionService.GetCameraForward()` now remembers the miss after the first attempt
+  (`_positionPairMissing`) and goes straight to `CameraVec` for the rest of the session, logging the
+  fallback exactly once ("Camera forward: CameraPosition/LookAtPosition unavailable, using CameraVec")
+  instead of retrying the dead pair every poll. The WT-specific
   `app.worldtour.WTCameraManager` (`StableRotation`/`CurrentActualRotation`, `IsDuringTransition`) and
   `PlayerCameraManager`/`WTPlayerCameraController` exist but are Behaviors with rotation-only state —
   the position-pair on `app.CameraManager` is simpler and mode-agnostic.
@@ -706,14 +730,49 @@ exist if ever needed: `app.GUIAccessDataManager.AccessTargetList`
 
 ### Continuous tracking (hands-free guidance)
 `Hooks/WorldTour/FieldTrackingHooks.cs` (shared readers extracted to
-`Services/WorldTour/AvatarFieldReader.cs`). Toggle key (provisional: keyboard M, no pad button — Start
-is taken by the radar) starts periodic guidance toward the NEAREST avatar: full sentence when the
-target changes ("Luke, maestro a las 12, a 5 metros"), terse `wt.clock_short` updates while closing in
-("a las 12, a 4 metros"), ~2 s cadence (`ANNOUNCE_TICKS`, same 60 fps LateUpdate tick convention as
-the radar poll). Silence rules: identical phrase → silent (standing still); holds while
-`SpTalkNovelHooks.DialogueActive` (static flag set in its OnBind/OnExit) or while
-`CurrentAccessInfoList` is non-empty (arrival is the target-change reader's moment); auto-off when the
-field unloads.
+`Services/WorldTour/AvatarFieldReader.cs`; sticky-target logic extracted to
+`Services/WorldTour/StickyTarget.cs`, also used by `FieldAimHooks`). Toggle key (provisional: keyboard
+M, no pad button — Start is taken by the radar) starts guidance toward the NEAREST NOTABLE person: full
+sentence when the target changes ("Luke, maestro a las 12, a 5 metros"), terse `wt.clock_short`
+updates while closing in ("a las 12, a 4 metros").
+
+**Notable people only (2026-09-07) — `Target => StickyTarget.NearestNamed`.** The tracker used to
+follow the literal nearest avatar (`StickyTarget.NearestPerson`); in World Tour's named, interactable
+crowd (see § Notable vs. crowd above) that meant a sentence per passer-by, each one passing at arm's
+length so its clock hour swept half the dial in a second. `AvatarNameCache.Notable(...)` filters
+`ReadOthers` down to masters/other players/NPC-context names before the sticky-pick, and the tracker
+returns silently (no reading, no "nobody nearby" spam) when that filtered list is empty. The homing
+pulse keeps following the raw nearest person, crowd included, so there is still a sound to walk toward
+even when nobody notable is close.
+
+**Cadence: events plus a distance-paced repeat (reworked 2026-09-05, then 2026-09-06 "verbalise more
+often, like the beacon", then 2026-09-07 for the slower notable-only pace) — `PENDING RUNTIME
+VERIFICATION`.** A terse update while walking to the SAME target fires when the clock hour changes or
+the rounded distance crosses a coarse band — drops below half, or rises above double, the last
+ANNOUNCED distance (`FieldTrackingHooks.CrossedBand`, reference floored at `MissionBeaconHooks.ARRIVED_M`
+= 4 m rather than a new literal) — and now ALSO on a distance-paced repeat when nothing changed, so a
+long straight approach is never silent for too long. The poll itself runs at `POLL_TICKS` = 30
+LateUpdate ticks (0.5 s at 60 fps) — cheap enough to check every half second, while whether an update
+is actually SPOKEN is still decided by the hour/band/repeat logic below, never by the poll alone.
+- **Repeat period (`RepeatPeriod`), slowed 2026-09-07:** linear between `REPEAT_NEAR_MS` = 5000 ms
+  (was 3000) at `MissionBeaconHooks.ARRIVED_M` (4 m, the interaction radius) and `REPEAT_FAR_MS` =
+  10000 ms (was 8000) at `FieldBeaconHooks.HOME_RANGE_M` (25 m, the edge of the homing range) and
+  beyond — the same ramp shape the NPC homing pulse already plays, so the voice and the sound agree
+  about urgency. Now that only notable people repeat at all, the faster crowd-era cadence read as
+  nagging for a master or a player standing still nearby.
+- **Hour changes silenced up close (`CLOSE_M` = 2 × `MissionBeaconHooks.ARRIVED_M` = 8 m, new
+  2026-09-07):** `hourMoved` requires `nearest.Dist > CLOSE_M`. Session log 2026-09-07: hour churn
+  ("a las 4, a las 5, a las 8") while pedestrians passed at 1–3 m — that close, a sideways step is a
+  full clock hour, and the homing pulse's pan already says which side. The distance-band and repeat
+  events are unaffected, so a notable target that close still updates, just not on every hour wobble.
+- A REPEAT is allowed to say the identical phrase again (`periodic` bypasses the "same as last spoken"
+  dedupe) — that is its job; an hour/band EVENT that lands on the same phrase as last time is still
+  swallowed as not-news.
+- Silence rules otherwise unchanged: standing still is silent (`FieldPresenceService.CanSpeakWhileMoving`);
+  holds while `SpTalkNovelHooks.DialogueActive`, while the panel guide (`PadGuideHooks.Active`) is
+  running, while `GetAccessInfoCount(mgr) > 0` (arrival is the target-change reader's moment), and for
+  `READER_HOLD_MS` = 1200 ms after any interrupting announcement from the reader — so a repeat never
+  lands on top of a tutorial line or an arrival announcement; auto-off when the field unloads.
 
 ### Diagnostics
 Log floats with `CultureInfo.InvariantCulture`: under a Spanish locale the decimal comma collides with
@@ -1063,23 +1122,115 @@ off `_Handles`, newest-first, as everywhere else.
 `app.UIFlowMessageLog.Param` (GUI `WTMessageLog`) is the **conversation recap** overlay, not the
 phone. It fires around the same moments; do not confuse the two.
 
+## World Tour phone map (`app.UIFlowWTDeviceMap`)
+
+Captured with F8 on 2026-09-07 (`sf6access_autodump_154237.txt`, lines 770-965) and implemented as
+`Hooks/WorldTour/DeviceMapHooks.cs` + `Services/WorldTour/DeviceMapText.cs`. The param is
+`app.UIFlowWTDeviceMap.MapParam` (namespace `app`, **not** `app.worldtour`, like the Missions app).
+
+- **State**: `FlowState` / `PreviousFlowState` (`eFlowState {MapView, TravelSelect, FastTravel,
+  FailedTravel, OpenWorldMap, FailedAddPin}`), `OperationMode` (`eOperationMode {Default,
+  TravelSelectOnly}`), `IsBattleHub`, `EnableFreeCursor`, `EnableSectionMap`, `EnableWorldMap`,
+  `EnableFastTravel`, `EnableOpenTravelList`, `IsCursorDecideEnable`, `PinColorIndex`,
+  `DispCityId` (400 = Metro City in the capture) / `DispSectionId`.
+  **Enum widths**: none of these enums declares an underlying type in the generated stubs, and that
+  generator *does* emit `: byte` where it applies (1027 of 5620 enums carry an explicit base), so
+  they are 4-byte ints → `ReadIntField`. The mod never compares them to literals: values go back
+  through `FlowHelper.ResolveEnumName` and are matched by member NAME.
+- **Texts**: `GuideMessage` is a plain, already-localized `System.String` field (no Guid);
+  `mTextCityName` and `mTextAreaName` are field-backed `via.gui.Text` (read `get_Message`).
+  There is **no `mTextTitle`** on the param — the "World Tour" header seen in the GUI dump belongs
+  to the phone frame, so the mod speaks its own word for the screen instead.
+- **Icons**: `mIconList` (`app.UIPartsMapIconGroup : UIPartsGroup`). The icon under the free cursor
+  comes from `MapParam.GetCursorSelectedItem() : UIPartsMouseOperable`; when its type name contains
+  `MapIconPanel`, read `Info : app.UIMapWindowBase.IconInfo` → `TitleText` (string),
+  `Type : ICON_TYPE`, plus `IsFastTravelPoint`, `UniqueIndex`, `GlobalPos`, `GroupType`. The panel
+  itself has `Focus`/`ForceFocus`/`CursolOn` (from `UIPartsMapIconPanelBase`) and its own
+  `mTextTitle` — used as the fallback when `Info.TitleText` is empty. **The panel carries no
+  distance and no section name**, so neither can be announced from here.
+  `ICON_TYPE` has 39 members; the mod maps them to nine family words by NAME prefix
+  (`SHOP_*`, `MISSION_*`, `MASTER*`, `FAST_TRAVEL`, `MERCHANT`, `CHALLENGER`, `ENEMY*`, `PIN_*`,
+  everything else → "point of interest") — lang keys `wt.map.icon_*` in `lang/en.txt` + `es.txt`.
+- **The icon names are already localized.** The capture's on-screen texts (lines 809-837) read
+  "Beat Square", "Chun-Li", "Style Lab Beauty Salon", "Moratones a los Caracartones" — so
+  `TitleText` is spoken verbatim and only the *kind* needs a mod-supplied word.
+- **Fast-travel list**: `mTravelPointList : app.UIPartsScrollList` (`SelectedIndex`, `ItemMax`;
+  no `_Children`, as always) over the data list `TravelPoint :
+  IList<app.worldtour.FastTravelPointUserDataRecord>`. A record has `id`, `CityID`, `SceneCityID`,
+  `IsMyRoom`, `TimeType` and `PointNameID.GUID` → `FlowHelper.ResolveGuidField`.
+  `SelectedTravelPoint` is **null until something is picked** (null in the MapView capture);
+  `GetSelectedFastTravelPoint(bool checkSelectedPanel)` is the method form.
+- **Other widgets**: `mGroupTop : UIPartsGroup`, `mCtrlTravelPointList`, `mCtrlFreeeCursor` (sic),
+  `mCtrlPinInfoPanel`, `mCtrlIconType`, `mCtrlAreaName`, `mFastTravelThumbnail`, `mSituation`,
+  `InputGuideDataList`, `DeviceMap : app.UIDeviceMapWindow`, `CityList :
+  IList<app.UIFlowWorldMap.ItemParam>`.
+- **`eTopGroupFocus {TravelList, IconList}` has no field.** The enum exists on
+  `app.UIFlowWTDeviceMap`, but no field of that type appears on `MapParam`, on
+  `Flow_MapView`/`Flow_TravelSelect`, anywhere else in the stubs, or in the dump. The closest live
+  signal is `mGroupTop._FocusIndex`; the mod reads it null-safely and logs it once per screen entry,
+  and announces nothing from it (the travel list and the map cursor each announce their own
+  changes, so moving between them is already audible).
+
+**Two follow-up dumps still needed:**
+1. **`TravelSelect` populated** — open the fast-travel list (the input guide's "Abrir viaje rápido")
+   and F9 there, to confirm `mTravelPointList.SelectedIndex` tracks the highlighted row and that
+   `TravelPoint` is in the same order as the rendered list.
+2. **An icon under the cursor** — park the free cursor on a map icon and F9, to confirm
+   `GetCursorSelectedItem()` returns the `UIPartsMapIconPanel` (and not the group or a hit-test
+   proxy) and that `Info.TitleText` / `Info.Type` are populated there. The same dump would confirm
+   whether `mGroupTop._FocusIndex` matches `eTopGroupFocus`.
+
 ## World Tour mission objective (for the audio beacon)
 
-`app.worldtour.WTMissionSystem` (singleton) → `FindProgressMissionId()` → one of
-`GetListNpcMissionTargetInfo(id)` / `GetListOmMissionTargetInfo(id)` / `GetListZoneMissionTargetInfo(id)`
-→ per record `HaveMissionTarget` and **`ListHolderObj`, a list of live scene `GameObject`s** →
-`get_Transform` → `get_Position`. So the objective is a real object, not a bare coordinate, which
-means a beacon can sound *on* it.
+**The game's own HUD marker answers first (2026-09-07, `Services/WorldTour/MissionGuideReader.cs` +
+`MissionTargetService.cs`).** `app.UICityHud_MissionGuide` is the on-screen arrow's own source of
+truth — it builds its own candidate list (`GetTargetNpc/OM/Zone`), picks one
+(`GetNeareastTarget`/`ChangeMissionTarget`), and parks it in its `missionTarget` field — so reading
+that field is reading exactly what a sighted player sees the arrow pointing at, including which
+mission the player has SELECTED when they have both a primary and a secondary mission active.
+`WTMissionSystem.FindProgressMissionId()` (below) answers "the mission in progress", the story's
+notion of the current objective, which is not necessarily the one in the phone the player picked — the
+HUD marker is the more accurate source, so it is tried first and wins whenever it resolves to a
+position; the mission-system route is the fallback for whatever the marker cannot answer (not built
+yet this loading screen, hidden, or following nothing).
 
-- All three lists are asked in turn: an objective is sometimes a person, sometimes a thing,
-  sometimes a place, and the game keeps them separate.
-- **An empty holder list is normal**, not an error: the target has not streamed into the loaded
-  scene (another district, or not spawned yet).
-- `WTPlayerDataMission.mProgressMainMissionId` is the save-data authority on which mission is the
-  MAIN one, if "whatever the HUD is tracking" ever proves too loose.
-- Not used, but noted: `app.UICityHud_MissionGuide.missionTarget.TargetObject` is what the on-screen
-  marker itself points at. Its sibling `UIPos` is a screen-space projection — **not** a world
-  position; never feed that to a 3D sound.
+**All member names below are decompile-only, unverified at runtime** — this is new code, not yet
+run in game.
+
+- **`MissionGuideReader.Read()`** finds the live `app.UICityHud_MissionGuide` component the same way
+  `FieldHeadingService` finds the minimap window: `via.SceneManager.get_CurrentScene()` →
+  `Scene.findComponents(System.Type)` with the guide's runtime type — the INSTANCE is never cached
+  (the HUD is rebuilt across loads), only the TDB lookups are. Reads `missionTarget`
+  (`ProgressMisionInfo`) → `TargetObject` (a live `GameObject`, same shape as the mission-system route
+  below) and `TargetType` (`app.UICityHud_MissionGuide.eTargetType`: NPC/OM/ZONE, same order as
+  `MissionTargetService`'s three lists so the index doubles as the enum value when naming the kind),
+  plus the guide's own `curProgressMissionId`. Absent (no component in the scene, or nothing selected)
+  is normal, logged nowhere; a genuine BIND failure (the type or a member missing, e.g. after a game
+  patch) is warned exactly once, naming the member: `Mission guide: cannot bind '<member>' on
+  app.UICityHud_MissionGuide; using WTMissionSystem only`.
+- **`MissionTargetService.Find()`** tries `FindFromGuide()` (the HUD marker) first, then falls back to
+  `FindFromMissionSystem()` (below) only when the marker yields no target or the target has no
+  readable position. One log line per CHANGE of objective (mission id, target kind, object, or a
+  switch between the two sources) — never once a second for a walking objective:
+  `Mission guide: id=<n> type=<NPC|OM|ZONE|?> source=<hud|system> pos=(x, y, z)`.
+- **Fallback — `app.worldtour.WTMissionSystem`** (singleton) → `FindProgressMissionId()` → one of
+  `GetListNpcMissionTargetInfo(id)` / `GetListOmMissionTargetInfo(id)` / `GetListZoneMissionTargetInfo(id)`
+  → per record `HaveMissionTarget` and **`ListHolderObj`, a list of live scene `GameObject`s** →
+  `get_Transform` → `get_Position`. So the objective is a real object, not a bare coordinate, which
+  means a beacon can sound *on* it.
+  - All three lists are asked in turn: an objective is sometimes a person, sometimes a thing,
+    sometimes a place, and the game keeps them separate.
+  - **An empty holder list is normal**, not an error: the target has not streamed into the loaded
+    scene (another district, or not spawned yet).
+  - `WTPlayerDataMission.mProgressMainMissionId` is the save-data authority on which mission is the
+    MAIN one, if "whatever the HUD is tracking" ever proves too loose.
+- `app.UICityHud_MissionGuide.missionTarget`'s sibling `UIPos` is a screen-space projection — **not**
+  a world position; never feed that to a 3D sound. (`TargetObject`'s own transform is the world
+  position used above.)
+
+**Verification (2026-09-07, pending):** accept a main and a sub mission, select the SUB one in the
+phone, and confirm the beacon and the logged `source=hud` id follow it; then switch back to the main
+mission and confirm the beacon follows that instead.
 
 ## World Tour — spatial navigation APIs (physics, navmesh, collision)
 
@@ -1377,6 +1528,125 @@ behavior against the now-confirmed handle is still `PENDING RUNTIME VERIFICATION
   (0..31)`) and node-query results against the handle have not yet been pursued/verified — see `PENDING
   RUNTIME VERIFICATION` above.
 
+**Now has a consumer (2026-09-08):** `Services/WorldTour/NavMeshOpenings.cs` is the first code to
+actually call `queryClosestNode(vec3)` and `queryLinkToNodes()` against this handle — see § World Tour —
+spatial navigation APIs, "2026-09-08: precision rebuild" below for the full recipe. This is still
+**code, not a runtime result**: the node-query behaviour itself remains `PENDING RUNTIME VERIFICATION`
+exactly as this section already said: nothing in the new file has run in game. `NavMeshOpenings` logs its
+own one-line answer (`[SF6Access] NavMesh openings: ...`) precisely so that question gets settled the
+next time World Tour is played, including the `node.Pos == (0,0,0)` trap called out in "Value-type reads:
+a known trap" above, which the new consumer treats as a marshalling bug rather than a real node at the
+origin.
+
+**`CRASHED THE GAME` on its first press (2026-09-08) — and what the post-mortem could and could not
+prove.** B in World Tour killed SF6 with a clean log: the last mod line was the radar's own
+`NavRadar verdict routes:` (10:35:21.422), written by the sample that runs immediately before the
+navmesh call, and no `NavMesh openings` line ever appeared. Every failure path before the node query
+writes a line, so the game died in the first unproven engine call and left no exception — the signature
+of a NATIVE fault (or a hang), which no C# `try/catch` can see.
+
+Cleared by the post-mortem, with evidence, so nobody re-suspects them:
+- *Argument marshalling of `queryClosestNode(vec3)`.* The parameter is BY VALUE (the decompiler marks
+  by-ref explicitly — `findIntersection(ref vec3, LineSegment)` in the same type), and the engine's own
+  generated binding passes a by-value `via.vec3` as an OBJECT whose `Ptr()` is the argument
+  (`app/CollisionSystem.cs:812` → `Invoke(null, new object[]{ start, end, ... })`). A `FieldOutBuffer`
+  view is exactly that. The same buffer + view shape ran nine times in the crashing session
+  (`Nav radar sideways probe: GetCastRayPosition`, 10:35:21.417).
+- *The route to the handle.* `WTCommon.CityResource` → `CityAIMap` → `findMapHandle()` was confirmed
+  2026-09-04 and every failure branch logs.
+- *`FindByShape` binding the wrong overload.* It matches name + 1 parameter whose type ends in `vec3`,
+  so it cannot reach `queryClosestNode(vec3, NodeQueryInfo)` nor the forbidden no-arg `queryNode()`.
+- *`GetCurrentCharacterControllerSizeRatio(ref float, ref float)`.* Not reached: the same session logged
+  `charaCtrl=missing`, so the capsule read returns 0 before the ratio call.
+- *Value-type return trap.* `via.navigation.map.NodeInfo` and `NodeInfoList` are REFERENCE types
+  (neither is marked `: ValueType` in the generated bindings, unlike `via.vec3`/`via.LineSegment`), so
+  no explicit value-type return handling is needed. `InvokeBoxed` is now given `typeof(object)` anyway —
+  `null` as a return type is only ever proven here for `void` methods.
+
+Still suspect, in order: the `queryClosestNode(vec3)` call itself (an unbounded search over a streamed
+city navmesh would hang exactly like this — the standing warning about no-arg `queryNode()` is the same
+family); then the wrappers REFramework builds around `queryLinkToNodes()` / `getNode(i)` results, which
+is the documented "bogus managed wrapper, AV in `ManagedObject.Finalize`, clean log" failure.
+
+**Rewritten for the next attempt (still `false` in `FieldNavRadarHooks.MESH_WAYS_ENABLED` — only the
+user re-enables it).** The engine calls moved to `Services/WorldTour/NavMeshNodes.cs`, one per method,
+each writing `[SF6Access] NavMesh step N: ...` BEFORE it runs, so the last step in the log names the
+call that did not return: **1** map handle, **2** `queryClosestNode(vec3)`, **3** the player node's
+`getGlobalVertexCount`/`getGlobalVertex`, **4** the avatar capsule, **5** `queryLinkToNodes`/
+`getNodeCount`, **6** `getNode(i)` and that neighbour's vertices, then the existing
+`[SF6Access] NavMesh openings: ...` summary (which also switches the trace off, so a working navmesh
+logs one line per city, not six per press). `NavMeshOpenings.cs` keeps the cache and the edge geometry,
+its duplicate capsule reader was replaced by `FieldRayCaster.CapsuleRadius()`, and a navmesh that fails
+is not re-queried until `Reset()` (it used to re-run a full query every sample whenever the capsule was
+unreadable, which is exactly the current in-game state).
+
+**2026-09-08, later session — crash root cause identified; pathfinder surface further mapped (nothing
+implemented yet).**
+
+**Root cause of the 2026-09-08 navmesh crash, now identified.**
+`Services/WorldTour/NavMeshNodes.cs:121` resolves the map handle with `FlowHelper.Call(aiMap,
+"findMapHandle")` — a **by-name** bind with **zero arguments** — while `via.navigation.AIMap` declares
+three overloads named `findMapHandle`: `()`, `(string)`, `(MapType)`. A by-name call is arity-blind — it
+returns the first TDB match regardless of parameter count — so the read could bind any of the three and
+hand back a handle for a map that was never the intended one; the very next call (`queryClosestNode`)
+then dereferenced that handle. This is the one by-name bind in a file whose whole premise (the
+"Rewritten for the next attempt" note above) is binding every other call by shape. **Secondary
+hypothesis, not yet tested:** Metro City is section-streamed (§ 7 below, `CitySectionManager`), so the
+live navmesh may belong to a `via.navigation.SectionManagerHandle` reached through
+`findMapHandleBase()`/`getManagers`, not to the plain `MapHandle` that `findMapHandle()` returns.
+
+**A synchronous pathfinder exists and looks safely bindable, by the same shape rule already proven for
+`castRayAll`.** `via.navigation.NavigationSurface.queryPathSync(via.vec3 start, via.vec3 end,
+via.navigation.PathQueryReport report) : bool`. Its parameter shape — two by-value `vec3` plus one
+caller-allocated reference-type result the engine mutates in place — is the same class already proven
+safe in this codebase for `app.CollisionSystem.castRayAll` (§ 2 above): a value-type `out`/`ref` gets a
+`FieldOutBuffer`, a reference-type result gets an ordinary `CreateInstance` object, never an `out`/`ref`
+**reference** type (the standing rule in `docs/sf6-architecture.md` § Critical IL2CPP gotchas). Read
+back `PathQueryReport.Exist`, `.PathInfo`; `PathInfo.calcDistance()` and `calcDistance(DistanceType.Raw
+vs .Path)` (a detour ratio — how much longer the walked path is than the straight line); `PathInfo.
+PathPointCount`; `getPathPointInfo(uint).PortalPos`.
+
+**The player's own avatar carries a `NavigationSurface`, bypassing the map handle entirely.**
+`AvatarBase.Components` → `AvatarComponent.Controll` (concrete type
+`app.worldtour.avatar.AvatarPlayerControll : AvatarNaviControllBase`) → field `NaviSurface`. Pre-flight
+checks before trusting it: `AvatarNaviControllBase.IsDontUseAIMap` and
+`via.navigation.Navigation.hasValidMap()` (0 parameters, bool).
+
+**Never bind `queryPath` (the async overload, no `Sync` suffix)** — one of its parameters is a
+`MulticastDelegate`, the documented crash family for a by-ref **reference**-type argument
+(`docs/sf6-architecture.md` § Critical IL2CPP gotchas, "NEVER call a method whose out/ref parameter is a
+REFERENCE type"). Bind `queryPathSync` by shape and match its name exactly — do not let a by-name lookup
+pick between the two.
+
+**Also confirmed unusable, recorded so they are not retried:** `Navigation.setAvoidNodes(IList<uint>)`
+(constructing a generic `IList<T>` is the interface/generic `CreateInstance` crash, § Critical IL2CPP
+gotchas above); `MapHandleBase.queryNode()` (unbounded, city-wide, stalls the game — standing warning,
+unchanged); `Navigation.adjust()`/`start()`/`stop()` (these drive the LIVE avatar's own navigation, not a
+read-only query).
+
+**Negative finding — the World Tour minimap is a dead end for walkability, not just for a compass.**
+`app.MapSettingBase.MapTexture` is a texture resource, and there is no `via.render.Texture` readback
+anywhere in this codebase or the decompiled sources; the only spatial data the map settings expose is one
+world-space AABB (`MinPos`/`MaxPos`). Recorded so a future pass does not try to read walkability off the
+map picture. Sub-finding worth keeping, since it IS usable: the world↔map transform exists and is
+already in production use — `app.UIMapWindowBase.ConvertTo_UIPos(vec3)`, bound by
+`Services/WorldTour/FieldHeadingService.cs:43` for the hands-free compass (§ 10 below) — and map icons/
+pins carry real world positions (`IconInfo.GlobalPos`, `PinInfo.Position`, § World Tour phone map above),
+which is a usable LANDMARK source, just not a walkability source.
+
+**Correction to a rule stated elsewhere in this codebase's docs: `get_X` is not unusable across the
+board.** The gotcha in `docs/sf6-architecture.md` § Critical IL2CPP gotchas concerns the REFramework-
+**generated C# interface property getter** (a typed proxy's `.Position`), which returns null/empty on a
+concrete IL2CPP instance. Calling `get_X` **by name through reflection** (`FlowHelper.Call(obj,
+"get_X")`) works, and this codebase already relies on it: `Services/WorldTour/MissionGuideReader.cs:108`
+and `Services/WorldTour/MissionTargetService.cs:121` both fall back to a by-name `get_` call when the
+backing field is absent. Field-first, `get_` by name as fallback, is the pattern to reach for on the
+pathfinder surface above too.
+
+**Status: still nothing implemented from this section.** Everything above is reverse-engineering
+groundwork for a future pathfinder-based radar/guidance layer; no shipped code calls `queryPathSync`,
+`NaviSurface`, or the map AABB.
+
 ### 7. Transit points (doors, fast travel, sections) — `CONFIRMED (decompiled)`
 - There are **no** `*Door*`/`*Gate*`/`*Entrance*`/`*Teleport*` types under `app.worldtour.*`. Building
   entrances are numbered "OM" objects (`app.worldtour.om.Om00xxxx`, e.g. `Om008000` = body shop) that
@@ -1409,6 +1679,80 @@ behavior against the now-confirmed handle is still `PENDING RUNTIME VERIFICATION
   IList<uint>)`(1630).
 - Interaction: `app.worldtour.WTContactSystem.GetActiveCallObjects() : IList<GameObject>`(8035),
   `ZoneInfoList`(7842), `EnterZoneContact`(8044).
+
+### 7b. Naming what a ray HITS, and sub-zones finer than a district (2026-09-07 research) — `UNVERIFIED`
+
+User request: "farola, poste, mostrador, saliendo de mostrador, puerta" on contact, and zones finer
+than the district ("calle X"). What the game has, from the decompiled sources (`sf6 code/`) plus
+every F10 probe dump in `reframework/data/`:
+
+- **No object labels on geometry.** There is no `app.*Prop*`/`*Door*`/`*Interact*` component on
+  World Tour static geometry; the `app.worldtour.om/*` classes are behaviour scripting for OMs, not a
+  name registry. A hit's `Collidable.GameObject` (`sf6 code/via.physics/Collidable.cs:19` →
+  `via.GameObject.Name`) is CONFIRMED reachable (`FieldRayProbe`, `getContactCollidable(uint)`), but
+  across all probe dumps the only values are `(no GameObject)` — baked level geometry — and chunk ids
+  `wtc0400_01` / `wtc0400_10`. "Farola" cannot come from a name.
+- **Three things a hit DOES expose** (now written per contact by the F10 probe, see below):
+  1. **collision layer** — `Collidable.FilterInfo.Layer` against `app.gCollision.LayerId`
+     (`Terrain, Character, TerrainRay, Attack, Damage, Sign, OMPress, GayaPress, NpcPress,
+     PlayerPress, Marker, Sensor, EffectChecker, EffectCheckRay, SoundSpace, SoundPosition, SoundRay,
+     SoundWall, EnvMarker, EnvSensor, ChainSelf, ChainEffector, Dynamic, Static`), named live through
+     `via.physics.System.getLayerName(uint)`. `Sign`/`OMPress`/`EnvMarker`/`EnvSensor` vs `Terrain`
+     is the coarse "interactable vs wall" split;
+  2. **surface material** — `via.physics.MaterialInfo{ Id, Attribute1..3 }` (`sf6 code/via.physics/
+     MaterialInfo.cs:15-45`), reachable from the game's own wall contacts
+     (`AvatarFieldParam_Volatile.CollisionInfo.WallContactInfoList → WallInfo{ Contact, Material }`,
+     § 5) and from `app.CollisionSystem.getWTEColMaterialID(vec3, bool, float)` (`CollisionSystem.cs:831`).
+     The only id→string table is the footstep system, `soundlib.SoundBodyMaterialParam`
+     (`MaterialNames : String_Array1D`, `MaterialValues : UInt32_Array1D`, `.cs:69-107`): that yields a
+     SURFACE word (concrete/wood/metal/glass/grass — internal English strings, to be mapped to
+     localized words once the real set is seen), not an object word. "Metal" for a lamp post,
+     "wood/glass" for a counter or a door is the most this route can give;
+  3. **the GameObject's Folder name and component types**, when a GameObject exists — an OM hit
+     carries an `app.worldtour.om.*` component, which is the real "this is a door / counter / vending
+     machine" signal, and it already has a NAME through `WTOmAccessTarget` (§ Notable vs. crowd).
+- **Sub-zones.** The district (`CitySectionManager` → `CitySectionDataUserDataRecord.SectionNameID`)
+  is the finest LOCALIZED level the game has; there are no street names. Candidates below it, none
+  wired: `app.UICityHud_SectionNotice.mTextSection : Text` (`UICityHud_SectionNotice.cs:147`, the
+  district banner's own resolved text — a cross-check, not new information);
+  `app.UICityHud_CityMiniMap.DispCityId/DispSectionId` (`.cs:11`); `app.worldtour.WTAreaManager`
+  `AreaInfo.AreaName : string` / `AreaNameHash` (`WTAreaManager.cs:341,349,1119`) plus
+  `NeighborhoodAreaList/AdditionalAreaList` (`:1197-1221`) and `WTCityManager.IsAreaStateActive(string)`
+  (`WTCityManager.cs:855`) — streaming CHUNK names (likely the same `wtc0400_xx` codes), useful at
+  most as an indoor/outdoor or "entered a shop interior" signal; `PointDataCityInfo` /
+  `udCityPointList.CityPoints` (city points beyond the 8 fast-travel points ZoneHooks already uses —
+  unexplored, may hold named shop/landmark POIs for a finer "near X"). `CityMessageUserDataRecord.
+  CityFlavorMessage` is a city description blurb, not a name.
+- **What shipped from this (both UNVERIFIED):** (a) the F10 probe's per-contact line now appends
+  `layer=N(Name) grp=g/s mat=Id attr=a/b/c folder='..' tag='..' comps=[..]` (`Services/WorldTour/
+  FieldProbeService.Collidable/MaterialText/GameObjectFolderAndTag/GameObjectComponents`); the
+  `Material` member is documented on `app.CollisionSystem.HitResult`/`WallInfo`, NOT confirmed on
+  `via.physics.ContactPoint`, so `mat=?` in a dump means "read the material from § 5 instead";
+  (b) "Leaving X" (`wt.leaving`) from the arrival reader when the announced interactable's range is
+  left with nothing else in range (`Hooks/WorldTour/FieldAwarenessHooks._announcedTarget`).
+- **First dump (15:41 2026-09-07, a plain wall), `CONFIRMED IN GAME`:** `obj='wtc0400_24'
+  layer=1(Terrain) grp=383/0 mat=? attr=?/?/? folder='wtc0400_24' tag='' comps=[via.Transform,
+  via.render.Mesh, via.physics.Colliders, via.dynamics.RigidBodyMeshSet,
+  app.sound.SoundObsOclTargetApp, app.WTEnvController]`. So: level chunks DO carry a GameObject
+  (chunk id, `app.WTEnvController`), `via.physics.ContactPoint` has NO `Material` member (`mat=?`),
+  and the layer names resolve live (`getLayerName` works: Terrain, TerrainRay, Character, OMPress,
+  EffectCheckRay, Dynamic seen on the avatar's own rays). Material must come from § 5's
+  `WallInfo.Material`, not the cast.
+- **The diagnostic is now AUTOMATIC (2026-09-07), not F10.** The player is blind and cannot aim a
+  one-shot probe key at a specific object, so `Services/WorldTour/ContactCatalog.cs` fires itself:
+  every navigation-radar sample where `FieldNavVerdictService`'s own verdict is the one
+  `FieldNavRadarHooks.BlockPhrase()` speaks as "wall"/"blocked" (never the ray-height ladder), it casts
+  once along the camera-forward direction (`FieldNavRadarService.CastFront`, same
+  `SWEEP_REACH_M` reach as the compass sweep), takes the NEAREST contact, and logs
+  `[SF6Access] Contact: dist=X.Xm layer=N(Name) grp=g/s obj='..' folder='..' tag='..' comps=[..]` —
+  built from the same `FieldProbeService.Collidable/GameObjectName/GameObjectFolderAndTag/
+  GameObjectComponents` helpers the F10 probe uses, so no reflection is duplicated. It logs only when
+  everything but `dist=` changed since the last logged line, at most once a second, so a session's log
+  becomes the "what did I just bump into" answer without needing sight to aim anything: walk around
+  normally with the radar on, bump into a lamp post, a counter, a door, a fence, a plain wall, then read
+  the distinct `Contact:` lines back. Wired only into the continuous-radar (Shift+B) tick, since that is
+  the only place the verdict is sampled repeatedly; a single **B** press also computes the verdict but
+  is a one-off readout, not a sampling loop, so it does not call the catalog.
 
 ### Design note
 The RE7 mod's radar (`D:\code\re engine\Re7Access`) is **reactive echolocation of geometry by raycast**
@@ -1447,8 +1791,8 @@ The NavMesh route stays open for a future "which way is walkable" layer; nothing
   `CastRayResult` per sample (never globalized, never held across frames); distance from
   `ContactPoint.Distance` via a getter bound on first use.
 - `Hooks/WorldTour/FieldNavRadarHooks.cs` — **B** one-shot readout, **Shift+B** continuous reactive
-  mode (cues only on confirmed state change: `impassable.mp3` / `exit.mp3`, panned ±0.8 for the sides,
-  a descending three-note motif for a drop).
+  mode (spoken obstacle class on confirmed state change, a descending three-note motif for a drop; the
+  `impassable.mp3`/`exit.mp3` open/closed cues moved to `NavBeams` 2026-09-07, see §9 below).
 
 Ladder rule for the front class: the HIGHEST rung of `FOOT_FRONT < FRONT < WAIST_FRONT < BUST_FRONT <
 HIWALL_FRONT` that reports a contact decides the class (`FOOT_FRONT`/`FRONT` share the low tier). Read
@@ -1507,3 +1851,616 @@ process (unmanaged memory never moves) instead of per sample.
 because cues only fired on open↔blocked. It now speaks the new class — **no** sound, since neither
 "closed" nor "opened" happened and re-firing a cue would lie; the 2-sample confirmation and the reader's
 duplicate filter keep it from chattering.
+
+### 9. Front verdict — the game's own obstacle answer, not the ray ladder (2026-09-05) — `PENDING RUNTIME VERIFICATION`
+**Symptom (user, in game):** "exit"/"open" announced while a waist-high wall was still stopping the
+avatar, and "wall" announced for things the avatar walks straight over.
+
+**Root cause.** The front class was derived from the height ladder alone, and a ladder of rays cannot
+answer "am I stopped". Three separate reasons: (a) the rungs have **different reaches** (`FRONT` 1.30 m,
+`FRONT_LONG` 2.00 m, the foot/waist/bust/hiwall rungs shorter), so mixing them makes "a rung hit" mean
+different distances per rung; (b) `TerrainRayFilter` does **not** see the fences and props the capsule
+nevertheless collides with, so a real obstruction can produce zero ray hits; (c) wall-ride walls read as
+plain walls. Meanwhile kerbs and low fences the game **auto-steps** lit up the low rungs and were spoken
+as obstacles.
+
+**Fix.** The rays now feed DISTANCE and DESCRIPTION only. Whether the avatar is blocked comes from the
+collision the game already resolves every frame — `Services/WorldTour/FieldNavVerdictService.cs`.
+
+Sources, in the order they are trusted (each resolved once and cached by the owning type's name):
+
+| # | route | members read |
+|---|---|---|
+| 1 | `AvatarBase.__GetVolatileParam().Collision` (`AvatarFieldParam_Volatile.CollisionInfo`, `:164`) — fall back to `AvatarState_FieldBase.VolatileParam` (`:2303`) | `ValidWallContactInfo`(`:332`), `IsWallContact()`(`:485`), `IsContactedDashStopWall`(`:428`), `WallMovableRate`(`:436`, 0..1) |
+| 2 | `AvatarBase.Components.CharacterController`, else `AvatarState_FieldBase.CollisionManager`(`:2367`)`.CharaController`(`AvatarCollisionManager.cs:385`) | `Wall:bool` |
+| 3 | `AvatarState_FieldBase.CollisionCache`(`:2375`) → `AvatarCollisionCache.GetGoupStepInfo(GoupStepTypes)`(`:248`) | `DoesGoupStepCheck`(`:220`), `GoupStepInfo.GetFlag(CheckFlagType.Seted)`(`:150`) |
+| 4 | `AvatarBase.GetContactedWallInfos(IList<ContactedWallInfo>)`(`:1602`) — **DISABLED 2026-09-06** | `ContactedWallInfo.CanWallRide`(`:820`) |
+
+Route 4 crashed the game: `FieldProbeService.NewInstance` built an instance of the generic interface
+`IList<ContactedWallInfo>`, REFramework wrapped the non-object it got back and the wrapper's finalizer
+raised `AccessViolationException` (`ManagedObject.Finalize`, GC thread) about 90 s into the field with
+a clean log. `CanWallRide` now returns false unconditionally (never claimed) and `NewInstance` refuses
+interfaces/abstract/generic types (see `docs/sf6-architecture.md`). Re-enabling needs a constructible
+concrete list type the engine accepts, e.g. `System.Collections.Generic.List<ContactedWallInfo>` if
+the TDB exposes that instantiation — not attempted.
+
+Confirmed signatures (decompiled, this run): `GoupStepTypes` is a **top-level** enum
+`app.worldtour.avatar.GoupStepTypes` = `{XS, S, M, FenceF, _NUM_}` (`_NUM_` is a count sentinel, never
+queried); `CheckFlagType` is nested as
+`app.worldtour.avatar.AvatarCollisionCache.GoupStepInfo.CheckFlagType` = `{Seted, RayRight, RayLeft,
+RayCenter}`; `GoupStepInfo` also publishes the raw `CheckedFlags:int` bitmask, but `GetFlag()` is used so
+no bit position is written down. `AvatarConstMoveParams.DashMove_StopWallRate` (`:120`) is an
+**instance** property (unlike the `static` members around it) reached from
+`AvatarState_FieldBase.ConstMoveParams` (`:2231`) or `__GetConstMoveParam()` (`:2810`). Note the game
+counts **fences** among the things it auto-steps (`GoupStepTypes.FenceF`).
+
+**Priority for the front verdict** (`NavReading.Block`, new enum `FrontBlock {None, WallRide, Blocked}`):
+1. **Wall contact this frame** → `Blocked`, in the game's own order of authority: invalid wall info →
+   not blocked; no `IsWallContact()` → not blocked; the contact is wall-rideable → `WallRide`;
+   `IsContactedDashStopWall` → `Blocked`; otherwise `WallMovableRate < DashMove_StopWallRate` →
+   `Blocked`. A rate outside its own 0..1 range counts as unread, and an unread rate never downgrades a
+   wall the player is touching to "open".
+2. **else** the auto-step cache has any size class `Seted` → the front is re-described as
+   `FrontProfile.Step` and nothing is blocking (this is the kerb/fence false positive).
+3. **else** the ray ladder's class stands as a **description** of what lies ahead within those rays' own
+   reach, with `Block = None`.
+4. **else** open.
+
+`FrontProfile` keeps its five members but is now documentation of *what is ahead*, never *am I stopped*.
+
+**Announcement rules** (`FieldNavRadarHooks`; cue vocabulary moved to beams 2026-09-07, see below):
+- The game's verdict (`NavReading.Block`) drives SPEECH only: `wt.nav_front_wallride` on entering a
+  `WallRide`, and the named class (or `wt.nav_front_blocked`) on `None → Blocked` **and** again on a
+  blocked-to-blocked class change (a kerb stepped up to the wall right behind it) — the word alone
+  carries a change of obstacle, no sound plays for either case.
+- `WallRide` never fires the impassable cue.
+- `impassable.mp3` / `exit.mp3` no longer belong to this verdict — they moved to `NavBeams` (below),
+  panned per beam instead of tied to the front verdict's open/blocked transition.
+- `CONFIRM_SAMPLES` debounce unchanged.
+
+**Fallback and diagnostics.** If **no** wall route binds, the radar reverts to the previous behaviour
+for blocking (any hit in the height stack = blocked) and logs a warning. The step route is independent:
+"the game will climb this by itself" holds whether or not a wall route bound, so it is applied first
+and ends the question -- nothing the avatar surmounts on its own is ever reported as a block. One info line is written
+once per session naming which routes answered:
+
+```
+[SF6Access] NavRadar verdict routes: volatile=ok, charaCtrl=missing, goupStep=ok, wallRide=untried, stopWallRate=0.300 (4 step classes, Seted=0)
+```
+
+`charaCtrl=missing` is EXPECTED when `volatile=ok` — route 2 is only tried when route 1 does not bind.
+`wallRide=untried` is expected until the avatar actually touches a wall; on a contact frame it reads
+`wallRide=disabled` (route 4 is deliberately not read, see above) — wall-ride is never claimed. `stopWallRate=fallback 0.50` means
+`DashMove_StopWallRate` could not be read and the midpoint of `WallMovableRate`'s own 0..1 range is
+being used instead.
+
+**Still unverified in game:** every one of the above. In particular: whether `WallMovableRate` stays low
+while merely *standing* against a wall (if it reads high when the avatar is not pushing, a stationary
+player at a wall would be reported not-blocked); whether `GoupStepInfo.Seted` means "found something
+climbable this frame" rather than "this slot has ever been initialised"; and whether route 4 binds at
+all. Read the route log line first — it says which of these the run actually exercised.
+
+**Continuous-mode openings — three camera beams, not an armed exit chime (2026-09-07) — `RETIRED
+2026-09-08, see § 9b's retraction note below: this second-pass beam design and the third-pass rewrite
+that followed it are both gone, replaced by the continuous tone bed.`** The
+2026-09-05/06 armed-exit design (`FieldNavRadarHooks._exitArmed`/`ExitCheck`: armed on
+`None → Blocked`, released once `not-Blocked` **and** `LongRangeClear` held for `CONFIRM_SAMPLES`) and
+the 2 m side feelers it used are GONE from the continuous mode. Symptom: "exit" only ever meant
+"nothing inside the 2 m forward feeler", with no direction and no persistence, so turning inside an
+enclosed yard to look for the way out produced "wall, exit, wall, exit" from every gap two metres deep
+without ever pointing at the street (user report 2026-09-07).
+
+Replacement, in `Services/WorldTour/NavBeams.cs` + `FieldNavRadarService.Beams`/`FreeCastContext`:
+three CAMERA-relative beams — front, left, right — each `FieldNavRadarService.BEAM_REACH_M` (30 ×
+`SWEEP_REACH_M` = 360 m, effectively unbounded) cast from the origin of the game's own `FRONT_LONG` ray
+via `FieldNavSideRays.TryCastDirection` (the shared free-form-cast plumbing, §8). A Hero's Call's
+porting guide is explicit that a capped reach turns "the far wall came into range" into a phantom cue
+and kills open-field silence, so there is no open/closed STATE any more — each beam just tracks its hit
+distance (a miss counts as the full reach), and a cue fires only on a confirmed JUMP in that distance:
+- **Jump gate:** `NavBeams.IsJump` — the reach must move by at least `NavBeams.JUMP_M` (0.25 ×
+  `SWEEP_REACH_M` = 3 m) AND by at least 25% of the shorter of the two readings. A facade edge a hundred
+  metres off that shifts the beam a few metres is scenery; five metres becoming nine is a doorway. Smooth
+  drift — walking along an angled wall, approaching a wall head-on — never crosses the gate and stays
+  silent; the spoken contact verdict (above) covers the head-on case.
+- **Silent first seed**, per beam: the first confirmed reading describes where the player already
+  stands and is not an event.
+- **Confirmation:** `FieldNavRadarHooks.CONFIRM_SAMPLES` (2 samples of the 10-tick sample cadence) — a
+  lamp post or a railing flickering a beam for one sample cues nothing. This is the STANDING-STILL
+  threshold; while walking a longer one applies (below).
+- **Moving vs. standing role, and a longer hold while walking (`NavBeams.Sample(hits, moving)`, new
+  2026-09-07).** `moving` comes from `FieldNavRadarHooks.Moved()`: the avatar's XZ position sampled each
+  tick against the previous sample, displaced ≥ `MOVED_EPS_M` = 0.05 m (a twentieth of a metre in a
+  sixth of a second — a fraction of the slowest walk, well above position-read jitter; an unreadable
+  position counts as standing, the quieter role). Two effects while `moving` is true:
+  - **The FRONT beam never cues.** It keeps tracking silently (`s.Announced` follows every sample) so
+    that the instant the player stops and turns, the scan starts from where it already is; walking
+    toward things changes the front beam constantly, and the spoken contact verdict is already the
+    front's warning while moving. The side beams keep cueing while walking — that is how a cross street
+    is heard on the side it lies on.
+  - **A confirmed change must hold for `MOVING_HOLD_SAMPLES` = 6 samples (one second at the 10-tick
+    cadence) instead of `CONFIRM_SAMPLES` = 2, in EITHER direction (open or close).** Session log
+    2026-09-07: open/close pairs half a second apart on the same beam ("Right opened to 30.8m" then
+    "Right closed to 3.5m" ~0.5 s later), 20 cues inside one 14 s burst — every one of them a false
+    positive reported by the player. At walking pace, one second of persistence is roughly a four-metre
+    feature: long enough to be a wall or a real cross street, short enough that a lamp post, a tree, a
+    parked car or the gap between two buildings — which cross a side beam in well under a second —
+    never confirm. A change that never confirms simply leaves the announced level alone (`s.Pending`
+    keeps following the drift), so the beam's return to the facade after a too-brief opening is not a
+    second event either. Standing still, the ordinary `CONFIRM_SAMPLES` applies, so a turn-scan still
+    hears both edges of a gap promptly.
+- **Per-beam cooldown:** `NavBeams.BEAM_COOLDOWN_MS` = 500 ms, so a beam jumping every confirmation
+  window still cannot chatter faster than twice a second.
+- **One cue per sample, openings first:** if several beams change in the same sample, a farther reading
+  (opening) beats a nearer one (closing — "a way out is worth more than "still a wall"), then front,
+  left, right in that fixed order; the rest wait for the next sample if they still differ, and are
+  swallowed if they drifted back.
+- **Cue:** `exit.mp3` when the reach jumps farther ("opened"), `impassable.mp3` when it jumps nearer
+  ("closed"), panned to the beam (`FieldNavRadarHooks.SIDE_PAN` = ±0.8 for left/right, centred for
+  front); the closing cue's VOLUME scales 0.15-0.5 by nearness over one street width
+  (`NavBeams.CLOSED_FAR_VOLUME`/`CLOSED_NEAR_VOLUME`) — a wall two metres off is news, one at the edge of
+  a street width is scenery.
+- **Turning is a deliberate scan:** the beams are re-aimed from the camera every sample, so sweeping the
+  camera across a gap plays the "opened" cue as the front beam enters it and the "closed" cue as it
+  leaves — both edges of the gap — and turning back plays them again. Standing still in a closed yard is
+  silent, because nothing changed: the silence IS "no way out here", and the chime IS "there".
+- Log line: `Nav beam Front opened to 42.0m` / `Nav beam Left closed to 4.1m`; `Nav beams failed` if the
+  sensor could not bind that sample.
+- Design source: `D:\code\modding projects\reference\audio-navigation\united-minecraft` (per-bearing
+  diff gate + cooldown + open-first dequeue) and its `a-heros-call` sibling (three beams, silent seed,
+  one cue at a time, turn-scan as an explicit design choice).
+
+The spoken class ("wall", "blocked", "wall you can run along") still comes from the game's own verdict
+(above), unchanged; only the open/closed SOUNDS moved from the verdict to the beams, so a contact is
+spoken once and the way through/around it is chimed, never the same fact twice — `impassable.mp3` is no
+longer played on the verdict block itself. **Note:** the one-shot `B` readout still reports left/right
+open/blocked from the original 2 m side feelers (`NavReading.LeftBlocked`/`RightBlocked`), so it can
+disagree with what the continuous mode's beams say about the same spot — different sensors answering
+different questions ("can I hug this wall" vs. "is there a way through at street scale").
+
+### 9b. Continuous-mode beams, THIRD pass (2026-09-07) — `RETIRED 2026-09-08, code deleted`
+
+**RETRACTED — history note, read before reaching for a beam design again.** Everything below describes
+`Services/WorldTour/NavBeams.cs` as it stood after the 2026-09-07 rewrite. That file, `FieldNavRadarService
+.Beams()` and `BEAM_REACH_M` are **deleted** as of the 2026-09-08 precision rebuild (§ World Tour —
+spatial navigation APIs, "2026-09-08: precision rebuild" below). `LocalizedText.NavExit` is now unused
+code left over from this design.
+
+The reason was not a bug in this particular pass — the three-beam and four-beam designs were both
+internally correct — but the whole *shape* of the thing: every version here was **event-only**, silent
+except at the instant a beam's reading crossed a threshold, and each of the three 2026-09-05/06/07
+tuning rounds made it fire *less* in order to kill chatter, which left it with almost nothing to say most
+of the time. It is replaced by an always-on continuous 4-tone bed (`NavToneBed.cs` +
+`NavProximityBed.cs`) that never needs a threshold because it has no state to flicker between — see the
+2026-09-08 section for the design and the reasoning (the shared audio-navigation reference's "3D
+first-person explorer" row, which this project had been building the *reactive supplement* for without
+ever building the *continuous backbone* it supplements). The spoken front-verdict system this sat next
+to (§9 above) is untouched by the retirement.
+
+Kept below for the record, since two real techniques live in it that may be worth reusing elsewhere: the
+open/closed hysteresis band, and the moving-vs-standing hold-time split.
+
+`Services/WorldTour/NavBeams.cs` rewritten after the 15:40 session (102 `Nav beam` lines in 7 min,
+user: "only the side cues sound; I don't want them by distance; long reach like A Hero's Call, but
+tell me what is nearest — an exit, an enclosed space"):
+
+- **Four beams** (`Beam.Front/Left/Right/Back`), cast by `FieldNavRadarService.Beams` at
+  `BEAM_REACH_M` (30 street widths) from the game's long-forward-ray origin; the back beam is
+  `-forward`.
+- **State, not jumps:** a beam is OPEN once it reads ≥ `OPEN_M` = `SWEEP_REACH_M` (12 m, "room to
+  walk a street width") and CLOSED again only under `CLOSED_M` = 0.75 × that (A Hero's Call's plane
+  epsilon as hysteresis). Silent first seed; a change must hold `CONFIRM_SAMPLES` (2) standing or
+  `MOVING_HOLD_SAMPLES` (6 = 1 s) walking; per-beam cooldown 500 ms; ONE cue per sample — exits first,
+  then the nearest closed surface (`State.Reach`). The front cues while walking too (state changes
+  only at 9/12 m, so one "wall ahead" per wall).
+- **Constant volume** (`AudioService.DEFAULT_VOLUME`); pan ±`SIDE_PAN` for the sides, centre for
+  front/back, back pitched down with `HomingCue.BEHIND_RATE` (the beacons' own convention).
+- **Enclosed / exit, spoken:** all four closed → `wt.nav_enclosed` once; the first beam to reopen
+  → `wt.nav_exit_{front,left,right,back}` on top of the open cue. Outside an enclosure only the
+  cues play.
+- Log: `Nav beam <Beam> opened|closed at X.Xm`.
+
+### 9c. Precision rebuild — player-filter sensor, continuous tone bed, NavMesh exits (2026-09-08) — `PENDING RUNTIME VERIFICATION`
+
+**Symptom (tester, blind, the mod's actual user):** "no logro nunca saber con precisión dónde hay una
+salida, o dónde realmente no puedo pasar" — cannot ever tell precisely where there is an exit, or where
+passage is genuinely blocked. This is the failure every beam iteration in §9/§9b tried to fix by tuning
+chatter down; this rebuild instead re-examined what was being measured and how it was being reported, and
+found five separate causes.
+
+**Diagnosis.**
+1. **Wrong filter.** The sweep casts with `eFilterInfo.TerrainRayFilter`, measured in game (§2 above) as
+   `layer=3:TerrainRay mask=0x8 [TCStopCamera]` — it measures what stops the CAMERA, not the avatar.
+2. **No continuous backbone.** The whole radar was 100% event-driven: it only ever spoke or sounded on a
+   CHANGE. The three beam redesigns across 2026-09-07 all consisted of making it sound *less*, which left
+   it with almost nothing to say. The shared cross-game reference
+   (`D:\code\modding projects\reference\audio-navigation\README.md`, "Which to use" table, "3D
+   first-person explorer" row) says the backbone for this genre must be CONTINUOUS sonification, with
+   discrete events as the supplement — this mod had only ever built the supplement.
+3. **Two contradictory notions of "open".** `NavBeams.OPEN_M` = 12 m (a street width, a UX choice) vs.
+   the game's own rays at ~2 m reach — a beam and the ray ladder could describe the same spot as open and
+   blocked simultaneously.
+4. **Synthetic side rays.** `SIDE_R`/`SIDE_L` (real published reach 0.40-0.60 m, § 8 above) were stretched
+   up to 6× their real length, amplifying grazing-angle noise rather than removing it.
+5. **Unclassified contacts.** Nothing discarded a walkable slope/ramp against the avatar's own
+   `SlopeLimit`, or a kerb (auto-stepped by the game) against a real wall — every blocking-shaped contact
+   was treated the same.
+
+**Fix 1 — a new sensor cast with the avatar's OWN filter, not the camera's.**
+`Services/WorldTour/FieldRayCaster.cs` (+ `FieldRayContacts.cs`, `FieldRayMetrics.cs`, `RayHit.cs`) is a
+new, independent sensor — it does not replace or call into `FieldNavRadarService` (§7-§9's nine-cast
+sweep, still `TerrainRayFilter`-based and still what drives B/Shift+B's SPOKEN obstacle class, unchanged
+by this rebuild).
+
+- **Overload, bound by SHAPE:** `app.CollisionSystem.castRayAll(vec3, vec3, via.physics.CastRayResult,
+  via.physics.FilterInfo, bool)` — five parameters, parameter 0 a value type, parameter 3 a REFERENCE
+  type. That last property is what tells it apart from its twin at `CollisionSystem.cs:805` taking the
+  `eFilterInfo` enum (a value type) — see § 2 above. No name string is matched; a build where no overload
+  fits this shape casts nothing and says so in the route log, rather than falling back to the camera
+  filter silently.
+- **Filter:** the avatar's own live `CharacterController.FilterInfo`
+  (`WTPlayerManager.GetAvatarPlayer()` → `AvatarBase.Components` — **one object, never a collection**,
+  the same trap documented in § 4 — → `CharacterController.FilterInfo`), not a table entry from § 2's
+  `eFilterInfo`.
+- **Origin:** the capsule's own mid-height above the avatar's feet — `CharacterController.Height` ×
+  `AvatarBase.GetCurrentCharacterControllerSizeRatio`'s height ratio, halved, then clamped inside one
+  `Radius` (scaled by the width ratio) of each cap so a degenerate ratio can never place the origin
+  outside the body. Third-person, so the origin is the avatar's transform, not the camera's — the same
+  choice the Design note (above) already made for §7's sweep.
+- **Classification** (`FieldRayContacts.Classify`): a contact's normal Y against
+  `cos(CharacterController.SlopeLimit)` — at or above, it is `Ground`; at or below the negated cut,
+  `Ceiling`; neither is ever a wall (ported directly from the RE7 mod's `RayCaster.cs` rule). Below a
+  step height it is `Step`. The step height itself comes from the published `FOOT_FRONT` ray's own start
+  height above the feet (`GetCastRayPosition`, read through the same unmanaged out-buffer plumbing § 8
+  already uses for `ref` vec3 parameters), falling back to
+  `AvatarConstSystemParams.RayOffset.RAY_STEP_UP` when that read fails; neither is ever written down as a
+  constant. Anything left over is `Wall`, or `Unknown` when the slope cut itself could not be read — an
+  unreadable normal is kept as a wall rather than silently dropped, since losing a real wall is judged the
+  worse mistake for a navigation aid.
+- **Architectural vs. clutter:** SF6 publishes no `isFixedObject` (the field the RE7 mod used for this on
+  RE7's engine build), so the cut is the collision LAYER NAME
+  (`via.physics.System.getLayerName(uint)`, § 2) against `{Terrain, Static}`, resolved once per layer id
+  and cached. Static level geometry carries no `Collidable`/`GameObject` at all, and that absence is
+  itself treated as architectural rather than demoted to clutter.
+- **Safety, carried over from the F10 probe's lessons (§ 1, § 3, § 8):** the `CastRayResult` is allocated
+  fresh per call and never held across frames; the vec3 endpoints are unmanaged `FieldOutBuffer`s, written
+  and read back through the same field metadata the engine uses, never a managed `CreateValueType`;
+  `getContactPoint`'s boxed `ContactPoint` return is read as the plain boxed value, never through the
+  generated interface (which reads back as zeros — "Value-type reads: a known trap" above); the
+  `castRay(..., out HitResult, ...)` overloads — a reference type behind an `out` — are never called,
+  the same call that is on record as having crashed `FieldRayProbe` earlier in this file.
+- **Diagnostics:** one line, logged once, `[SF6Access] FieldRayCaster route: ...` — the bound overload,
+  the filter's layer/group/mask, and every derived threshold (waist height, slope cut, step height,
+  whether layer names bound), each naming itself as unavailable rather than being silently skipped.
+- **Batching:** `TryCastMany(dirs, maxDistance, hits)` resolves the avatar, its filter and every threshold
+  ONCE per sample and fires every requested direction from that same origin at that same instant — the
+  audit's point that two directions of one reading must never be able to disagree because the avatar
+  moved between them.
+
+**Fix 2 — an always-on continuous tone bed, replacing event cues as the backbone.**
+`Services/WorldTour/NavToneBed.cs` is a direct NAudio port of this team's own proven DRG/Megabonk
+wall-sonification synth (design doc `D:\code\modding projects\reference\audio-navigation\
+wall-sonification\README.md`, source `D:\code\unity and such\drg access\drgAccess\Components\
+WallNavigationAudio.cs`): 4 directional channels — front 500 Hz, back 180 Hz, sides 300 Hz (pitch tells
+front/back apart; § README invariant 2), sides hard-panned ±1 and front/back centred (pan tells
+left/right apart; invariant 3), each a per-sample-smoothed 70% triangle + 30% sine wave (frequency
+smoothing 0.05, volume smoothing 0.02, both tuned by ear in the source mods) so a changing distance is
+heard as a glide, never a click. Channels are created once by `Ensure()` and mixed into
+`AudioService`'s shared NAudio mixer via `AudioService.AddPersistentInput`; they are **never stopped**
+for the life of the process — only their volume moves, which is the mechanism that makes "silence" mean
+"open" rather than "not currently checking".
+
+`Services/WorldTour/NavProximityBed.cs` is what drives it every sample: four rays — front/back/left/right
+of the CAMERA (the frame World Tour direction is already reported in, per the Design note above) — cast
+in one `FieldRayCaster.TryCastMany` call, reach `FieldNavRadarService.SWEEP_REACH_M` (12 m, the existing
+"street width" constant — reused rather than inventing a second reach the bed and the rest of the radar
+could disagree about), quadratic falloff `1 − norm²` (same shape as the DRG/Megabonk source), `minRange`
+= the avatar's own live capsule radius (`FieldRayCaster.CapsuleRadius()`) — the closest the waist origin
+can physically get to a wall is exactly where the tone must already be at full volume. A `Step` contact
+is deliberately NOT sonified (it is a kerb the avatar climbs on its own; humming at it would teach the
+player to avoid ground they can freely walk over); an `Unknown` contact IS sonified, on the same
+worse-mistake reasoning as the classifier above. `Ground`/`Ceiling` never reach this layer at all — they
+are discarded inside `FieldRayContacts` before a `RayHit` is even returned.
+
+**Fix 3 — the actual answer to "where is the exit": the NavMesh, not a ray fan.**
+`Services/WorldTour/NavMeshOpenings.cs` is the first code in this codebase to exercise § 6's confirmed
+`AIMap.findMapHandle()` handle with a real node query — see § 6's own update above. Route:
+`app.global.WTCommon.CityResource` → `WTCityResources.CityAIMap` → `AIMap.findMapHandle()` →
+`queryClosestNode(vec3)` — picked apart from the sibling `(vec3, NodeQueryInfo)` overload by argument
+count, never by name string, since a by-name call could bind either; the zero-argument
+`MapHandleBase.queryNode()` is **never** called anywhere in this file (§ 6's standing warning: unbounded,
+city-wide, stalls the game). Every linked neighbour of the node under the player
+(`NodeInfo.queryLinkToNodes()`) is walked, and the edge shared with each is found geometrically — the
+vertices the two polygons hold in common, via `getGlobalVertexCount`/`getGlobalVertex` (world space, not
+`getVertex`'s node-local space, which would mix frames) — so that shared edge's length IS the doorway's
+real width, at any distance, and a neighbour node flagged `Wall` is excluded regardless of that width.
+`Passable` compares the width against the avatar's live capsule diameter (`Radius` × the width ratio from
+`GetCurrentCharacterControllerSizeRatio`, the same live scaling § 4 documents). Nothing engine-owned is
+cached between calls — the handle and every `NodeInfo` are re-resolved per query, since city streaming can
+retire them — but the RESULT is cached as plain floats and only recomputed once the player has moved half
+their own capsule width, which is what makes this affordable to poll a few times a second. Logs one line,
+`[SF6Access] NavMesh openings: queryClosestNode(vec3) ok via WTCommon.CityResource.CityAIMap.
+findMapHandle(); node (x, y, z) vs player (x, y, z); N vertices, M links, K shared edges, capsule D m` —
+printing the node's own position NEXT TO the player's own already-trusted position is deliberate: an
+exact `(0, 0, 0)` there is called out explicitly as "Value-type reads: a known trap" (above) rather than
+reported as a real node at the world origin, since the edge widths come from `getGlobalVertex` and remain
+meaningful either way.
+
+**Negative finding — a ring of rays cannot answer "where is the exit"; recorded so it is not
+retried.** `Services/WorldTour/NavOpenings.cs`, a ring-of-rays gap detector, was written during this
+session and then DELETED before shipping. A standalone 2D simulation (independent of the game) was run
+first and found two failures with no tuning fix:
+- **Angular resolution.** With 24 rays at 15° spacing, a 1.6 m gap at 6 m subtends about 5° — no ray
+  passes through it. The simulated profiles for "a straight street", "a street with a doorway" and "a
+  street with a narrow slot" came out IDENTICAL. Seeing a gap that size reliably at 20 m would need on the
+  order of 78 rays, which is not an affordable per-sample cast count.
+- **Grazing-angle false positives.** A single flat wall viewed at a shallow angle produces a distance jump
+  between neighbouring rays as large as a real gap does, so the same 24-ray fan reported a plain straight
+  street as having 8 "exits".
+
+Conclusion kept for future reference: **a ray fan can answer "what is near me on each side", never "where
+is the exit" — that question belongs to the NavMesh** (Fix 3 above), which has no angular resolution limit
+because it reasons about polygon edges rather than sampled directions.
+
+**Wiring.** `Hooks/WorldTour/FieldNavRadarHooks.cs`: **Shift+B** (continuous mode) now drives
+`NavProximityBed.Update` every sample instead of the retired beams (§9b); **B** (one-shot readout) is
+unchanged for the spoken obstacle class but now additionally appends the NavMesh's passable openings —
+`wt.nav_opening` ("opening at {hour} o'clock, {width} meters wide, {distance} meters away") for each
+passable gap nearest-first, or `wt.nav_gap_narrow` for the nearest too-narrow gaps when nothing passable
+is in range, or `wt.nav_no_openings` when the query itself returned nothing. The tone bed is silenced
+during World Tour dialogue and on leaving the field (`NavProximityBed.Reset()` /
+`NavMeshOpenings.Reset()`, called from the same `ResetContinuous()` the mode already used); the channels
+themselves are torn down in `Plugin.Unload` (`NavToneBed.Shutdown()`) ahead of `AudioService.Shutdown()`.
+New lang keys `wt.nav_opening`, `wt.nav_gap_narrow`, `wt.nav_no_openings` added to `lang/en.txt` and
+`lang/es.txt`. **Nothing else about the radar changed:** the nine-cast sweep, the `TerrainRayFilter`
+filter, and the `FieldNavVerdictService`-driven spoken class from §9 are exactly as documented there.
+
+**Status: compiles with 0 errors/warnings; NOTHING in this section has run in game.** See `STATUS.md` §
+"Built but not yet verified in game" (2026-09-08 entry) for the in-game verification checklist.
+
+### 9d. Line-memory radar retired; body-clearance passability model shipped (2026-09-08, later session) — `PENDING RUNTIME VERIFICATION`
+
+**Symptom that started this pass.** § 9c's "second pass" (`FieldRadarService.cs`, an event radar that
+remembered the LINE each beam looked at and spoke when that line broke — a faithful port of A Hero's
+Call's `ReactiveRadar` by way of the RE7 mod's `RadarService`) was measured in Metro City and fired **109
+cues in 90 seconds at 109 DIFFERENT contact points** — 36 cues per 30 s, almost none coalescing into
+repeats, and (unlike an earlier session that alternated between two static surfaces) no alternation
+between fixed points this time. So the detector was not malfunctioning: it was correctly reporting that
+a city facade changes slope roughly once a second — shopfront recesses, columns, awnings, kerbs, benches.
+
+**Retired and DELETED — `Services/WorldTour/FieldRadarLines.cs`.** Recorded here as a negative finding,
+the same way the ring-of-rays gap detector is recorded in § 9c, so nobody re-implements it. Two
+independent reasons, both structural (no tuning fixes either):
+1. AHC's world is a tile grid, where a slope change in the geometry IS a corner or a door. A city street
+   is not, so an event model whose triggering event (a slope change) is real and near-continuous cannot
+   be tuned quiet.
+2. A line break means "this beam now sees PAST where the boundary was" — a depth discontinuity, not a
+   passage. A 40 cm shopfront recess produces one exactly as readily as a real doorway does. This is what
+   made the mod announce "exit to your right", after which walking right produced the spoken verdict
+   "blocked" — the cue channel and the spoken verdict were answering two different questions and could
+   openly contradict each other.
+
+An earlier round in the same lineage had already capped the line model's reach (`ReachM`) from AHC's
+1000 m down to 30 m — AHC's own `GameConfig.ScanDistance` — after measuring a beam alternating between
+two static surfaces 21.2 m apart in depth, recurring to within 9-27 cm of each other: camera drift across
+a depth edge. That fix worked (100 cues/30 s → 36) and its lesson (cap the reach to something the world
+actually has) is not undone by this retirement; it just was not the whole problem, as the 109-cues
+session above shows.
+
+**Replacement — a body-clearance PASSABILITY model, `Services/WorldTour/FieldRadarClearance.cs`.** The
+radar now asks "can the player go that way", not "did the geometry change".
+- **Input:** the waist row of each beam, already cast as three parallel rays at the capsule centre and at
+  ±its radius (`FieldRayCaster.TryCastBodyStack`, § 9c), taking the MOST obstructed of the three — so the
+  measurement is how far the avatar's BODY can advance, not how far a single ray can. A beam grazing a
+  corner cannot report the street behind it, because the outer ray hits the corner first.
+- **Output** is a STATE per beam (`PassState`: `Unknown` / `Passable` / `Blocked`), not an event. Nothing
+  sounds while a verdict holds; only a beam that CHANGES verdict speaks.
+- **Two thresholds with a dead band between them**; inside the band the previous verdict stands. The
+  avatar must physically travel metres to flip a verdict, where the line model flipped on a fraction of a
+  degree of camera settle.
+- **Debounce:** a changed verdict must persist for `FieldRadarTuning.StateConfirmMs` (4 sensing
+  intervals) before it is believed — rejects a pedestrian or a car crossing a beam for a frame or two.
+- **Silent seed:** the first verdict a beam ever forms is seeded SILENTLY, so arming the mode, a
+  teleport, or entering a new area does not open with three cues at once.
+- **Turning is still the scan, selectively.** While the camera turns, the LATERAL beams keep measuring
+  but stay silent — every verdict they form belongs to a different slice of the world, so speaking
+  mid-sweep would be reporting a place the player has already turned away from. The FRONT beam keeps
+  talking regardless, so sweeping the camera still aims the player at exits (AHC's own
+  `ResetAllButFrontRadar` precedent, already noted in `FieldRadarService.cs`'s own header). The beam
+  pointing away from the direction of travel is likewise held silent.
+- **Duplicate cues are no longer filtered — they are UNREPRESENTABLE.** A `PassState` cannot settle twice
+  into the same value without passing through the other value first, so the per-beam coalescer in
+  `Services/WorldTour/FieldRadarCues.cs` was deleted outright, together with the now-orphaned tuning
+  constants `PosNoiseFloorM`, `MinStepM`, `LineSameCos`, `DepthDiscontinuityM`, `SameCueCoalesceMs` (all
+  were line-memory-only knobs).
+
+**One shared definition of "blocked" — the fix for the exit/blocked contradiction.** Root cause found:
+the spoken readout calls a side blocked whenever anything sits inside `FieldNavSideRays`' own segment,
+whose length is the game's own longest published forward feeler (`FRONT_LONG`, **2.00 m** at runtime,
+§ 8 above) — while the radar's cue channel used to cut its blocked boundary somewhere else entirely.
+`FieldNavSideRays` now exposes `PublishedReachM` (the last measured length of that segment) and
+`FieldRadarClearance` uses it as its own blocked boundary, falling back to
+`FieldRadarTuning.BlockedEnterRadii * bodyRadius` (4 body radii = 2.0 m at the reported 0.5 m capsule)
+only before the probe has measured once. One boundary, measured from the game, instead of two that
+happen to agree — or, as measured, do not.
+
+**Passable threshold, and why the dead band costs nothing.** Passable requires
+`FieldRadarTuning.PassableEnterRadii` (12 body radii = 6.0 m at the reported capsule). Clearance is
+measured ALONG the beam, so a side alley reports its own DEPTH (tens of metres) while the open side of an
+ordinary street reports half its WIDTH (one to three metres) — the quantity is bimodal with nothing in
+between, which is why a dead band this wide buys total stability for free. **Honest caveat, recorded so
+it is not mistaken for a game-published number:** the 12-radii multiplier is a DESIGN choice, calibrated
+against RE7's own measured door-leaf span of 3 body radii (`FieldRadarTuning.DoorLeafSpanRadii`, cited to
+RE7's `RadarService.cs:193`), not something read from SF6 itself. It is printed in the arming log line so
+a session in play can correct it.
+
+**Status: compiles; nothing in this entry has run in game.** See `STATUS.md` § "Built but not yet
+verified in game" for the in-game checklist and the baseline to compare against (36 cues/30 s, measured
+above).
+
+### 10. World Tour compass, aim and sweep (2026-09-05) — `PENDING RUNTIME VERIFICATION`
+Three new hands-free/on-demand readers and one shared support service, all built on top of the
+navigation-radar sensors above and the clock-direction maths in `FieldDirectionService`. None of this
+has run in game yet.
+
+**Camera look-input hold — `Services/WorldTour/CameraHoldService.cs`.** Every direction announcement
+(compass sector change, aim-at-nearest alignment) needs the player to actually stop turning for the
+word to still be true when it lands. `app.worldtour.WTPlayerCameraController` consumes the look input
+in two per-frame methods found in the decompiled controller: `camera_input_proc(dt)` for the pad stick
+and `camera_input_proc_with_mouse(dt, axis)` for the mouse. Dynamic pre-hooks (`AddHook(false)`, pre
+only, method-level so a controller recreated between cities costs nothing) return
+`PreHookResult.Skip` on both while `CameraHoldService.Holding` is true, so those frames apply no look
+input at all — movement input is a different code path and is untouched. `CameraHoldService.HOLD_MS`
+= 50 ms is a user preference: long enough to release the stick, short enough not to read as a stutter.
+`CameraHoldService.Hold()` extends an in-progress hold but never shortens one. `Available` reports
+whether either method was actually found and hooked — false means announcements still speak but
+nothing freezes.
+
+**Hands-free compass — `Services/WorldTour/FieldHeadingService.cs` + `Hooks/WorldTour/FieldHeadingHooks.cs`.**
+Speaks one of 8 compass points (clockwise from north, `FieldHeadingService.SECTORS`) whenever the
+camera's facing crosses into a new sector, gated the same way as the other hands-free WT readers
+(field presence, not during dialogue or the panel guide) and quiet at rest. **2026-09-06:** reads sit
+behind a `POLL_TICKS` = 6 gate (10 Hz at 60 fps, same as `FieldAimHooks` below) instead of running every
+frame — no turn crosses a 45° sector in a tenth of a second that the hysteresis would not have
+swallowed anyway, and the gate also removed log spam from the underlying camera reads ("Member not
+found: CameraPosition/LookAtPosition", "get_Count").
+
+- **Where north comes from.** The game defines no compass constant anywhere (decompiled types
+  searched: no "north", no map rotation offset). What it does have is the minimap:
+  `app.UIMiniMapWindow` (found by walking the scene the same way `GuiTextReader` finds GUI
+  components) exposes `ConvertTo_UIPos(vec3)`, which projects a world position onto the map picture —
+  and in "Fixing" (north-up) mode, resolved via `get_MapRotateFlag()`, that picture's "up" is what a
+  sighted player calls north. **North is derived, not guessed:** probe the map at the player's
+  position and at two offsets, `+X` and `+Z` (`PROBE_M` = 1 m, any non-zero length works since the
+  projection is affine), giving the two columns of the world→UI linear map:
+  `world +X -> (ax, ay)`, `world +Z -> (bx, by)` (each column = probed point − origin point). GUI
+  coordinates grow **downward** (top-left origin), so "up the picture" is the vector `(0, −1)`; solving
+  `M · n = (0, −1)` for that 2×2 matrix gives the world-space direction that projects straight up,
+  which is normalized and cached as north. The solve is refused below `MIN_DETERMINANT` (a degenerate
+  projection, not a real map) and retried every `RETRY_MS` = 2 s while it fails. A rotating minimap
+  (camera-relative, `MapRotateFlag` true) is not a compass at all and is skipped outright.
+- **Fallback:** `NORTH_FALLBACK` = world `+Z`, used until the minimap derivation binds (or if it never
+  does). Chosen pending in-game confirmation — 2026-09-05. Which source is in effect is always logged
+  (`"Heading: north from minimap = (...)"` vs `"...from fallback axis = (...)"`), so a wrong guess is
+  visible rather than silently trusted. `Reset()` on leaving the field forgets north so the next city
+  derives its own.
+- **Heading maths.** Headings are camera-relative, computed with the SAME
+  `FieldDirectionService.GetBearing` the clock readout uses, with north as the "forward" argument:
+  `heading = atan2(bearing.Right, bearing.Ahead)`, wrapped to `[0, 360)`, so the compass and the clock
+  can never disagree about left and right (confirmed handedness: rightward = `forward × up = (−fz,
+  fx)`, § Clock direction above). `Sector(heading) = round(heading / 45°) mod 8`.
+- **Hysteresis.** A sector switch is accepted only once the heading is `HYSTERESIS_DEG` = 7.5° (a
+  sixth of the 45° sector) past the CENTRE-relative half-width, via
+  `OffsetFromSectorCentre`: `|offset| > 22.5° − 7.5°` must hold before the new sector is spoken. Small
+  enough that a deliberate turn is answered promptly, large enough that a hand resting near a stick
+  edge does not flap between two names. The very first reading after entering the field is remembered
+  silently (no announcement on arrival).
+- Each announcement calls `CameraHoldService.Hold()` before speaking, interrupting whatever was being
+  said (`interrupt: true`) — a turn in progress is exactly when the player wants the newest word.
+- `FieldHeadingHooks.CurrentFacing()` exposes the current point name (or null) for other readers to
+  append (see Z below).
+
+**Look-sweep — `Hooks/WorldTour/FieldAimHooks.cs`, reworked 2026-09-06, then again 2026-09-07 (user
+request: find a specific NPC, e.g. "talk to Chun-Li", just by looking — no keys, no menus, no spam) —
+`PENDING RUNTIME VERIFICATION`.** As the camera turns, every NAMED person — crowd included
+(`AvatarNameCache.NameOf(o)`; only the nameless are skipped) — it sweeps across is announced with their
+distance ("Chun-Li, 12 meters away", "Kenneth, person, 4 meters away",
+`LocalizedText.AtMeters`), so a player hunting for someone specific can stand still, turn, and hear who
+is where. The shared nearest person (`StickyTarget.NearestPerson`, the same one the continuous tracker
+and the homing pulse follow — the RAW nearest, crowd included, not filtered to notable) additionally
+gets a rising two-note tone (`AudioService.NoteMi` → `NoteLaHigh`) and "{name}, straight ahead"
+(`LocalizedText.AimAhead`) — the one instant answer the tracker's periodic clock readout cannot give,
+and it still works standing still.
+- **Only while the camera is actually turning (new 2026-09-07, `IsTurning`/`SCAN_TURN_DEG_PER_S`).**
+  Walking down a street, people walk INTO the aim cone by themselves — before this, that produced a
+  running commentary the player never asked for. `SCAN_TURN_DEG_PER_S` = half a clock hour per second
+  (`FieldDirectionService.DEGREES_PER_HOUR / 2`) is the threshold, measured between two 10 Hz polls
+  (`_lastForward`/`_lastForwardTick`); slower than that is the follow camera settling behind a walking
+  avatar, not a deliberate look-around. A Hero's Call gates its own automatic scan the same way (silent
+  while walking straight, spoken on a turn). **Cone bookkeeping (`InCone`) still runs every poll
+  regardless of `turning`** — only the speech/tone OUTPUT is gated — so a look-back after walking
+  straight past someone finds exactly the people it should, not a stale "already seen" state.
+- **Cone:** entering is `ENTER_DEG` = half of `FieldDirectionService.DEGREES_PER_HOUR` (±15°, half a
+  clock hour, the same precision the clock readout already promises); leaving is `LEAVE_DEG` = a full
+  hour (30°) — wider, so a person sitting near the edge cannot retrigger by jitter.
+- **Range:** only people within `SCAN_RANGE_M` = `FieldBeaconHooks.HOME_RANGE_M` (25 m, now `internal`
+  so the sweep and the homing pulse share one literal) are swept — beyond it the homing pulse is silent
+  too, and a name a street away is not something the player can walk to by ear.
+- **Crowd is spoken by the sweep (user rule 2026-09-07):** unlike the tracker's voice, the sweep does
+  NOT filter to notable people — a passer-by can be fought or talked to for an item, and a look is the
+  player asking. A notable-only sweep was tried the same day and rejected for that reason; the turn gate
+  is what keeps it from being a census. Only the nameless are skipped (`AvatarNameCache.NameOf` null —
+  the tone still marks them when they are the shared nearest). Earlier filter (`DescribeAvatar(...) !=
+  null`), which spoke every crowd passer-by since World Tour names them too.
+- **No per-person cooldown (removed 2026-09-07):** `SCAN_REPEAT_MS` is gone. The only anti-spam left is
+  the angular hysteresis above (now compounded by the turning gate) — entering the cone while turning
+  speaks/tones every time, so looking away past `LEAVE_DEG` and back re-announces the same person, on
+  purpose (user rule 2026-09-07: "found them, overshot, coming back" must answer). A 10 s cooldown was
+  tried first and swallowed exactly that case, so it was removed rather than tuned. The shared nearest
+  person is likewise re-spoken — tone, "straight ahead" and the camera hold all fire again — on every
+  re-entry; the old once-per-person `Seen.NamedAsTarget` flag that suppressed the repeat is gone.
+- **One sentence per poll, nearest first:** `AvatarFieldReader.ReadOthers` is already nearest-sorted, so
+  only the nearest person whose speech is due is spoken this poll; everyone else due waits for the next
+  one. Non-interrupting (`interrupt: false`) for the sweep's name-and-distance line — it is a background
+  listing and the reader already speaking is free to finish; the shared-nearest-person's "straight
+  ahead" line still interrupts (`interrupt: true`), since that is the one instant answer worth cutting
+  in for.
+- Polled at `POLL_TICKS` = 6 LateUpdate ticks (10 Hz at 60 fps) — reading the avatar list is the
+  expensive part; faster than the tracker's beat since the camera turns quickly. The turning check is
+  measured between these same polls, so it needs no extra reads.
+- Silence rules mirror the tracker's: nothing during dialogue, the panel guide, or while an
+  interaction prompt is already up (`AvatarFieldReader.GetAccessInfoCount(mgr) > 0` — the arrival
+  reader owns that moment).
+- **State:** a `Dictionary<ulong, bool>` (`InCone`) keyed by avatar ADDRESS, holding only whether that
+  avatar is currently inside the cone — no last-spoken tick and no per-target "named once" flag any
+  more, since there is nothing left to cool down. Pruned every poll against the field's current avatar
+  list (`Alive`/`Gone`), and cleared (`Reset()`) on leaving the field.
+
+**Shared sticky target — `Services/WorldTour/StickyTarget.cs`.** Extracted 2026-09-05 so the
+continuous tracker and the aim reader can never name different people; 2026-09-06 gained a third
+follower, the NPC homing pulse (`Hooks/WorldTour/FieldBeaconHooks.cs`, see below), so all three agree
+on who "the nearest person" is. `Pick(others)` (others pre-sorted nearest-first by
+`AvatarFieldReader.ReadOthers`) keeps the currently tracked avatar, matched by ADDRESS (never a cached
+`ManagedObject` — an address is a plain number, safe to hold across frames, and simply fails to match
+once stale), until somebody else beats it by more than `DEFAULT_SWITCH_MARGIN_M` = 2 m. `Reset()`
+forgets the target (used when presence/target list drops out) so the next `Pick` starts unbiased.
+`StickyTarget.NearestPerson` is the one shared static instance every follower calls.
+
+**Shift+Z compass sweep — `Hooks/WorldTour/FieldSweepHooks.cs`, `FieldNavRadarService.Sweep`,
+`FieldNavSideRays.TryCastDirection`.** On demand only (by design — a picture of the street is worth
+asking for and worthless as running commentary): casts one ray per compass point (8, index 0 = north,
+clockwise) and answers in one sentence, e.g. "Open: north, east. Walls: south 3 meters, west 6
+meters" (`LocalizedText.SweepOpen`/`SweepWalls`/`SweepAllOpen`/`SweepEntry`/`SweepUnavailable`).
+- **Origin:** the start point of the game's own `FRONT_LONG` ray for the current field state (read via
+  `GetCastRayPosition`, the same origin the forward-stack sensor already trusts) — not an invented
+  chest-height offset.
+- **Directions:** built from north (`FieldHeadingService.GetNorth()`) rotated by `k × 45°`; east is
+  derived the same right-hand way the clock hours are, `(ex, ez) = (−north.Z, north.X)`. Each direction
+  vector is cast via `FieldNavSideRays.TryCastDirection`, which reuses the free-form
+  `CastRayAll(ref vec3 start, ref vec3 end, CastRayResult, eFilterInfo)` overload and the same
+  process-lifetime unmanaged `FieldOutBuffer`s the sideways probe already allocated (§8) — no new
+  buffers, no per-call allocation.
+- **Reach:** `FieldNavRadarService.SWEEP_REACH_M` = 12 m — a documented UX literal, not a game value.
+  The game's longest published ray (`FRONT_LONG`, 2 m) is a feeler for walking, not a look-around
+  distance; 12 m was picked as "a street in Metro City is of the order of ten metres across", so the
+  sweep reads as a picture of the immediate street rather than the whole district. If this needs
+  tuning after the in-game pass, it is the one number to change.
+- Each entry is the hit distance along that ray, or 0 (open) when nothing was hit within the reach;
+  `Sweep()` returns null (spoken as `SweepUnavailable`) when the sensor or north cannot be reached at
+  all — never a fabricated "all open".
+- **Key:** Shift+Z, via `Services/ReadoutShortcut.cs` (`new ReadoutShortcut(VK_Z, PAD_NONE, shift:
+  true)`) — the same shortcut class used by every other letter-key reader, gated on
+  `ReadoutShortcut.IsGameForeground()` so it never fires while the user types elsewhere, and its
+  `shift: true` constructor argument means the CHORD only, leaving plain Z to `ZoneHooks` untouched
+  (the two never fire together off one key edge).
+
+**Z now appends facing — `Hooks/WorldTour/ZoneHooks.WithFacing`.** The on-demand "where am I" key (Z)
+now answers both "where am I" and "which way am I looking" in one sentence: "In Beat Street, facing
+north" (`LocalizedText.Facing`, appended via `FieldHeadingHooks.CurrentFacing()`). Manual reads only —
+the automatic (hands-free) zone announcement on a district change stays bare, since the hands-free
+compass already covers turning on its own.
+
+**Key bindings recap (World Tour field, all provisional pending a check against the game's own
+bindings — see STATUS.md):** `B` one-shot nav radar readout, `Shift+B` toggle continuous nav radar,
+`N`/pad Start nearby-avatar radar, `Z` speak current area (+ facing), **`Shift+Z` new: compass sweep**.
+The hands-free compass, aim-at-nearest and camera hold have no keys at all — they run continuously
+while in the field, gated the same way as every other always-on WT reader.

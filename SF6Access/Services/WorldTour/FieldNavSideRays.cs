@@ -108,6 +108,46 @@ public static class FieldNavSideRays
                && CastOne(state, getPos, castSeg, result, filterId, leftRayId, reach, out leftBlocked);
     }
 
+    /// <summary>One horizontal segment of <paramref name="reach"/> metres from the
+    /// origin of the game's own ray <paramref name="originRayId"/> (its start point
+    /// gives the height; the direction is replaced by the ground-plane
+    /// <paramref name="dirX"/>, <paramref name="dirZ"/>, which must be unit length).
+    /// Used by the compass sweep. False means the cast could not be run;
+    /// <paramref name="hitDistance"/> is 0 when nothing was hit.</summary>
+    public static bool TryCastDirection(ManagedObject state, ManagedObject result, int filterId,
+                                        int originRayId, float dirX, float dirZ, float reach,
+                                        out float hitDistance)
+    {
+        hitDistance = 0f;
+        if (state == null || result == null || filterId < 0 || originRayId < 0 || reach <= 0f) return false;
+
+        var td = state.GetTypeDefinition();
+        string typeName = td?.GetFullName();
+        if (typeName == null) return false;
+
+        var getPos = Resolve(GetPosByState, td, typeName, "GetCastRayPosition", 3, RAY_TYPE_SUFFIX);
+        var castSeg = Resolve(CastSegByState, td, typeName, "CastRayAll", 4, VECTOR_SUFFIX);
+        if (getPos == null || castSeg == null) return false;
+        if (!EnsureBuffers(getPos, castSeg)) return false;
+
+        try
+        {
+            if (!Segment(state, getPos, originRayId, _start, _end, out float _dx, out float _dy, out float _dz,
+                         out float _len))
+                return false;
+
+            float sx = _start.Component("x"), sy = _start.Component("y"), sz = _start.Component("z");
+            if (!WriteVector(_end, sx + dirX * reach, sy, sz + dirZ * reach)) return false;
+
+            result.Call("clear");
+            castSeg.InvokeBoxed(null, state, new object[] { _start.View, _end.View, result, filterId });
+            int count = FieldProbeService.ContactCount(result);
+            hitDistance = count > 0 ? FieldNavRadarService.NearestContact(result, (uint)count) : 0f;
+            return true;
+        }
+        catch { return false; }
+    }
+
     /// <summary>One extended ray: ask the game where its own short feeler runs, keep
     /// that origin and direction, push the far end out to the reach, cast.</summary>
     private static bool CastOne(ManagedObject state, Method getPos, Method castSeg, ManagedObject result,
@@ -135,6 +175,18 @@ public static class FieldNavSideRays
         catch { return false; }
     }
 
+    /// <summary>The last reach this probe measured, in metres, or 0 before the first
+    /// successful read.
+    ///
+    /// <para><b>This is the boundary the spoken readout means by "blocked".</b> A side
+    /// is called blocked when anything at all sits inside this segment, so the number
+    /// is not a detail of this file: it is the mod's definition of a side being shut,
+    /// and the radar's cue channel MUST cut at the same place or the two contradict
+    /// each other. They did, and a player was told "exit to your right", turned right
+    /// and was told blocked. <see cref="FieldRadarClearance"/> reads it here so there is
+    /// one boundary, measured from the game, rather than two that happen to agree.</para></summary>
+    public static float PublishedReachM { get; private set; }
+
     /// <summary>The reach the sideways rays inherit: the length of the state's own
     /// longest forward probe, measured from the segment it publishes rather than
     /// stated as a number here.</summary>
@@ -142,9 +194,11 @@ public static class FieldNavSideRays
     {
         try
         {
-            return Segment(state, getPos, reachRayId, _reachStart, _reachEnd,
-                           out float _x, out float _y, out float _z, out float length)
-                ? length : 0f;
+            if (!Segment(state, getPos, reachRayId, _reachStart, _reachEnd,
+                         out float _x, out float _y, out float _z, out float length))
+                return 0f;
+            PublishedReachM = length;
+            return length;
         }
         catch { return 0f; }
     }

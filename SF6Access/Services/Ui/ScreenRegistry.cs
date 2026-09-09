@@ -117,6 +117,9 @@ public class ScreenRegistry
         UiDispatcher.Register(new SF6Access.Hooks.WorldTour.MissionListHooks());
         UiDispatcher.Register(new SF6Access.Hooks.WorldTour.MissionDetailHooks());
 
+        // World Tour phone: Map (city map icons + fast-travel list)
+        UiDispatcher.Register(new SF6Access.Hooks.WorldTour.DeviceMapHooks());
+
         API.LogInfo("[SF6Access] ScreenRegistry: adapters registered");
     }
 }

@@ -5,7 +5,17 @@ namespace SF6Access.Services.WorldTour;
 /// <summary>
 /// Where the current World Tour mission wants you to go.
 ///
-/// <para>The game tracks this in <c>app.worldtour.WTMissionSystem</c>:
+/// <para><b>The HUD marker answers first.</b> The mission the PLAYER selected
+/// (primary or secondary) is the one the game's own on-screen arrow follows, and
+/// that arrow reads its target out of <c>app.UICityHud_MissionGuide</c> — see
+/// <see cref="MissionGuideReader"/>. Whenever that yields a target we can take a
+/// position from, it wins, because it is the player's choice rather than the
+/// story's.</para>
+///
+/// <para>The mission system below stays as the fallback for everything the HUD
+/// cannot answer: the marker not built yet, hidden, or following nothing.</para>
+///
+/// <para>The fallback tracks this in <c>app.worldtour.WTMissionSystem</c>:
 /// <c>FindProgressMissionId()</c> gives the mission the HUD is following, and
 /// <c>GetList{Npc,Om,Zone}MissionTargetInfo(id)</c> return that mission's target
 /// records. Each record carries <c>ListHolderObj</c> — a list of LIVE scene
@@ -26,7 +36,9 @@ public static class MissionTargetService
     private const string FIND_PROGRESS_ID = "FindProgressMissionId";
 
     // The three target kinds, in the order they are asked. NPC first: a mission
-    // objective is a person far more often than not.
+    // objective is a person far more often than not — which is also the order of
+    // the game's own app.UICityHud_MissionGuide.eTargetType (NPC, OM, ZONE), so
+    // the index doubles as that enum's value when naming the kind in the log.
     private static readonly string[] TargetListGetters =
     {
         "GetListNpcMissionTargetInfo",
@@ -47,12 +59,36 @@ public static class MissionTargetService
         }
     }
 
-    private static bool _loggedOnce;
+    // What the last logged fix was. The log line is worth having on every CHANGE
+    // of objective and worthless once a second for the same one.
+    private static string _lastLogKey;
 
     /// <summary>Locate the current mission objective. Re-resolved every call —
     /// never cached, because the mission, the target and the object behind it all
     /// change underneath us.</summary>
     public static Target Find()
+    {
+        var hud = FindFromGuide();
+        return hud.Ok ? hud : FindFromMissionSystem();
+    }
+
+    /// <summary>The objective the game's own HUD marker is following — the
+    /// player's selected mission. Not-ok whenever the marker has nothing, or its
+    /// target has no readable position yet.</summary>
+    private static Target FindFromGuide()
+    {
+        var guide = MissionGuideReader.Read();
+        if (!guide.Ok) return default;
+
+        var p = PositionOf(guide.TargetObject);
+        if (!p.ok) return default;
+
+        LogFix("hud", guide.MissionId, MissionGuideReader.TargetTypeName(guide.TargetType),
+               guide.TargetObject, p.x, p.y, p.z);
+        return new Target(guide.TargetObject, p.x, p.y, p.z);
+    }
+
+    private static Target FindFromMissionSystem()
     {
         var sys = API.GetManagedSingleton(MISSION_SYSTEM) as ManagedObject;
         if (sys == null) return default;
@@ -66,8 +102,9 @@ public static class MissionTargetService
         try { missionId = System.Convert.ToUInt32(idBoxed); }
         catch { return default; }
 
-        foreach (string getter in TargetListGetters)
+        for (int kind = 0; kind < TargetListGetters.Length; kind++)
         {
+            string getter = TargetListGetters[kind];
             var list = FlowHelper.Call(sys, getter, missionId) as ManagedObject;
             int n = FlowHelper.GetListCount(list);
             for (int i = 0; i < n; i++)
@@ -90,17 +127,28 @@ public static class MissionTargetService
                     var p = PositionOf(go);
                     if (!p.ok) continue;
 
-                    if (!_loggedOnce)
-                    {
-                        _loggedOnce = true;
-                        API.LogInfo($"[SF6Access] Mission target found via {getter} " +
-                                    $"(mission {missionId}) — the beacon has something to point at");
-                    }
+                    LogFix("system", missionId, MissionGuideReader.TargetTypeName(kind),
+                           go, p.x, p.y, p.z);
                     return new Target(go, p.x, p.y, p.z);
                 }
             }
         }
         return default;
+    }
+
+    /// <summary>One log line per CHANGE of objective — a new mission, a new
+    /// target kind, a different object, or a switch between the HUD marker and
+    /// the mission system. The position is a snapshot at that moment, not a
+    /// tracked value: an objective that walks does not deserve a line a second.
+    /// </summary>
+    private static void LogFix(string source, uint missionId, string type,
+                               ManagedObject go, float x, float y, float z)
+    {
+        string key = $"{source}|{missionId}|{type}|{FlowHelper.AddressOf(go):X}";
+        if (key == _lastLogKey) return;
+        _lastLogKey = key;
+        API.LogInfo($"[SF6Access] Mission guide: id={missionId} type={type} source={source} " +
+                    $"pos=({x:0.0}, {y:0.0}, {z:0.0})");
     }
 
     private static (float x, float y, float z, bool ok) PositionOf(ManagedObject go)

@@ -12,9 +12,16 @@ namespace SF6Access.Hooks.WorldTour;
 /// orientation.
 ///
 /// <list type="bullet">
-/// <item>The area is announced whenever it CHANGES, hands-free, like walking
-///   through a door in RE7.</item>
-/// <item><b>Z</b> speaks it again on demand, at any time.</item>
+/// <item>The area is announced automatically, hands-free, whenever it CHANGES —
+///   but only for real containment: a game district (<see cref="ZoneSource.Section"/>)
+///   or the city fallback (<see cref="ZoneSource.City"/>). The nearest-landmark
+///   route (<see cref="ZoneSource.NearestPoint"/>) is NOT announced automatically
+///   (2026-09-05): in dense areas the nearest landmark flips every few steps, and
+///   an automatic "near X, N metres" for every flip was constant chatter, not
+///   orientation.</item>
+/// <item><b>Z</b> speaks the current reading on demand, at any time, from
+///   whichever route resolved — landmark included. It stays the only way to hear
+///   a landmark reading.</item>
 /// </list>
 ///
 /// <para>The name itself is resolved by <see cref="ZoneNameService"/>, which
@@ -94,7 +101,13 @@ public class ZoneHooks
             // Keyed on the NAME, not on the section id or the landmark id: two
             // fast-travel points share the name 'Beat Square', and walking from one
             // to the other has not changed which area the player is in.
-            if (zone.Ok && GameStateTracker.HasChanged(ZONE_KEY, zone.Name))
+            //
+            // The tracker is updated on every change regardless of source, so a
+            // section re-entered after a run of landmark flips still reads as
+            // "changed" — but only a Section or City change is actually QUEUED for
+            // the automatic announcement; the landmark route stays Z-only.
+            bool changed = zone.Ok && GameStateTracker.HasChanged(ZONE_KEY, zone.Name);
+            if (changed && zone.Source != ZoneSource.NearestPoint)
                 _pending = zone;
         }
 
@@ -123,7 +136,7 @@ public class ZoneHooks
         if (!zone.Ok)
         {
             // "I don't know" is an ANSWER: only ever said to someone who asked.
-            if (manual) ScreenReaderService.Speak(LocalizedText.ZoneUnknown(), interrupt: true);
+            if (manual) ScreenReaderService.Speak(WithFacing(LocalizedText.ZoneUnknown(), manual), interrupt: true);
             return;
         }
 
@@ -136,10 +149,22 @@ public class ZoneHooks
 
         // The automatic one queues behind whatever is being said; the requested one
         // takes the floor.
-        ScreenReaderService.Speak(spoken, interrupt: manual);
+        ScreenReaderService.Speak(WithFacing(spoken, manual), interrupt: manual);
         if (!manual) return;
         // A manual read counts as having announced this area, so walking on does
         // not immediately repeat it.
         GameStateTracker.HasChanged(ZONE_KEY, zone.Name);
+    }
+
+    /// <summary>The on-demand answer also says which way the camera faces
+    /// ("In Beat Street, facing north"): the same key answers both "where am I"
+    /// and "which way am I looking". The automatic announcement stays bare —
+    /// the hands-free compass (<see cref="FieldHeadingHooks"/>) already covers
+    /// turning.</summary>
+    private static string WithFacing(string spoken, bool manual)
+    {
+        if (!manual) return spoken;
+        string facing = FieldHeadingHooks.CurrentFacing();
+        return facing == null ? spoken : spoken + ", " + LocalizedText.Facing(facing);
     }
 }

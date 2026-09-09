@@ -18,6 +18,7 @@ public static class AvatarFieldReader
     // app.HudDef.ContactUIType — the kind of interactable (source of the enum
     // values, not magic numbers): None = -1, NPC = 0, Legendary = 1, OM = 2,
     // OtherPlayer = 3. "Legendary" is a Master; "OM" is an object/gimmick.
+    public const int CONTACT_NONE = -1;
     public const int CONTACT_NPC = 0;
     public const int CONTACT_LEGENDARY = 1;
     public const int CONTACT_OM = 2;
@@ -133,11 +134,12 @@ public static class AvatarFieldReader
         {
             var pm = API.GetManagedSingleton(PLAYER_MANAGER) as ManagedObject;
             if (pm == null) return (0f, 0f, 0f, false);
-            // Getter FIRST: LocalPlayerObject is a property with no backing field,
-            // so asking for the field logs a "Member not found" line on every
-            // read — and this runs several times a second.
-            var go = FlowHelper.Call(pm, "get_LocalPlayerObject") as ManagedObject
-                     ?? FlowHelper.GetObjectField(pm, "LocalPlayerObject");
+            // LocalPlayerObject is a property, so the read lands on its getter.
+            // One call: GetObjectField resolves the accessor once per concrete type
+            // and no longer probes (or logs) the field name it does not have, which
+            // is what the old "getter first, field second" pair was working around
+            // — at the cost of resolving and invoking the getter twice per read.
+            var go = FlowHelper.GetObjectField(pm, "LocalPlayerObject");
             var tr = FlowHelper.Call(go, "get_Transform") as ManagedObject;
             var p = FlowHelper.Call(tr, "get_Position");
             if (p == null) return (0f, 0f, 0f, false);
@@ -166,6 +168,17 @@ public static class AvatarFieldReader
     /// fallback name source (crowd NPCs may have no access target).</summary>
     public static string DescribeAvatar(ManagedObject avatar)
     {
+        var (name, kind) = Classify(avatar);
+        if (name == null) return null;
+        string word = KindWord(kind);
+        return string.IsNullOrEmpty(word) ? name : $"{name}, {word}";
+    }
+
+    /// <summary>Name and <c>HudDef.ContactUIType</c> of an avatar. Kind is
+    /// <see cref="CONTACT_NONE"/> when the name came from the NPC context
+    /// fallback or there is no name at all.</summary>
+    public static (string Name, int Kind) Classify(ManagedObject avatar)
+    {
         try
         {
             var go = FlowHelper.Call(avatar, "get_GameObject") as ManagedObject;
@@ -181,11 +194,7 @@ public static class AvatarFieldReader
                     // Searcher components also match the substring but have no
                     // GetDispName — the empty-name check skips them naturally.
                     string name = FlowHelper.CleanTags(FlowHelper.Call(c, "GetDispName") as string)?.Trim();
-                    if (!string.IsNullOrEmpty(name))
-                    {
-                        string kind = KindWord(ReadContactType(c));
-                        return string.IsNullOrEmpty(kind) ? name : $"{name}, {kind}";
-                    }
+                    if (!string.IsNullOrEmpty(name)) return (name, ReadContactType(c));
                 }
                 else if (t.EndsWith("WTNpcContext"))
                 {
@@ -195,11 +204,11 @@ public static class AvatarFieldReader
             if (npcContext != null)
             {
                 string name = FlowHelper.CleanTags(FlowHelper.Call(npcContext, "get_NpcName") as string)?.Trim();
-                if (!string.IsNullOrEmpty(name)) return name;
+                if (!string.IsNullOrEmpty(name)) return (name, CONTACT_NONE);
             }
         }
         catch { }
-        return null;
+        return (null, CONTACT_NONE);
     }
 
     /// <summary>World position of an avatar via its GameObject's Transform.
@@ -243,23 +252,21 @@ public static class AvatarFieldReader
         return boxed != null ? System.Convert.ToInt32(boxed) : -1;
     }
 
-    /// <summary>Read a getter-only property: field (incl. backing field) first,
-    /// then the <c>get_</c> accessor — the WT access structs expose these as
-    /// properties with no plain field.</summary>
-    public static ManagedObject GetProp(ManagedObject obj, string name)
-    {
-        if (obj == null) return null;
-        return FlowHelper.GetObjectField(obj, name)
-               ?? FlowHelper.Call(obj, "get_" + name) as ManagedObject;
-    }
+    /// <summary>Read a getter-only property — the WT access structs expose these as
+    /// properties with no plain field.
+    /// <para><see cref="FlowHelper.GetObjectField"/> already tries the field, the
+    /// <c>get_</c> accessor and the backing field, in that order, off one cached
+    /// resolution; a second <c>Call("get_" + name)</c> behind it would only resolve
+    /// and INVOKE the same getter again.</para></summary>
+    public static ManagedObject GetProp(ManagedObject obj, string name) =>
+        FlowHelper.GetObjectField(obj, name);
 
     /// <summary>The field's avatar list, unwrapped: <c>AvatarList</c> is a
     /// <c>SafeList&lt;T&gt;</c> wrapper whose <c>get_Count</c> isn't the standard
     /// accessor, so fall back to its inner <c>System...List</c> field.</summary>
     private static ManagedObject GetAvatarList(ManagedObject mgr)
     {
-        var avatars = FlowHelper.GetObjectField(mgr, "AvatarList")
-                      ?? FlowHelper.Call(mgr, "get_AvatarList") as ManagedObject;
+        var avatars = FlowHelper.GetObjectField(mgr, "AvatarList");
         if (avatars == null) return null;
         if (FlowHelper.GetListCount(avatars) == 0)
         {
